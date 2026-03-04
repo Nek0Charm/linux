@@ -1767,7 +1767,7 @@ static u64 ___bpf_prog_run(u64 *regs, const struct bpf_insn *insn)
 	};
 #undef BPF_INSN_3_LBL
 #undef BPF_INSN_2_LBL
-	u32 tail_call_cnt = 0;
+	volatile u32 tail_call_cnt = 0;
 
 #define CONT	 ({ insn++; goto select_insn; })
 #define CONT_JMP ({ insn++; goto select_insn; })
@@ -2054,26 +2054,42 @@ select_insn:
 		struct bpf_prog *prog;
 		u32 index = BPF_R3;
 
-		if (unlikely(index >= array->map.max_entries))
-			goto out;
+		/* 1. 记录尝试发起的尾调用信息 */
+		trace_printk("BPF_TAIL_CALL: Attempting... Map: %p, Index: %u, Current tail_call_cnt: %u\n",
+				map, index, tail_call_cnt);
 
-		if (unlikely(tail_call_cnt >= MAX_TAIL_CALL_CNT))
+		if (unlikely(index >= array->map.max_entries)) {
+			trace_printk("BPF_TAIL_CALL: FAIL - Index out of bounds (%u >= %u)\n", 
+					index, array->map.max_entries);
 			goto out;
+		}
+
+		if (unlikely(tail_call_cnt >= MAX_TAIL_CALL_CNT)) {
+			trace_printk("BPF_TAIL_CALL: FAIL - Max limit reached (%u)\n", 
+					tail_call_cnt);
+			goto out;
+		}
 
 		tail_call_cnt++;
 
 		prog = READ_ONCE(array->ptrs[index]);
-		if (!prog)
+		if (!prog) {
+			trace_printk("BPF_TAIL_CALL: FAIL - Empty slot at index %u\n", index);
 			goto out;
-
+		}
+		/* 2. 记录成功的跳转（记住，执行这行之后，当前程序就一去不复返了） */
+		trace_printk("BPF_TAIL_CALL: SUCCESS - Jumping to new prog (ptr: %p). New cnt: %u\n",
+				prog, tail_call_cnt);
 		/* ARG1 at this point is guaranteed to point to CTX from
 		 * the verifier side due to the fact that the tail call is
 		 * handled like a helper, that is, bpf_tail_call_proto,
 		 * where arg1_type is ARG_PTR_TO_CTX.
 		 */
 		insn = prog->insnsi;
-		goto select_insn;
+		goto select_insn; /* 直接把解释器的指令指针（insn）替换掉，重新进入循环 */
 out:
+		/* 3. 记录失败后的“继续执行” (Fallthrough) */
+		trace_printk("BPF_TAIL_CALL: FALLTHROUGH - Continuing execution of current prog.\n");
 		CONT;
 	}
 	JMP_JA:
