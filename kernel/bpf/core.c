@@ -17,6 +17,7 @@
  * Kris Katterjohn - Added many additional checks in bpf_check_classic()
  */
 
+#include <linux/atomic.h>
 #include <uapi/linux/btf.h>
 #include <crypto/sha1.h>
 #include <linux/filter.h>
@@ -70,6 +71,31 @@
 
 struct bpf_mem_alloc bpf_global_ma;
 bool bpf_global_ma_set;
+
+static atomic64_t bpf_trace_run_id = ATOMIC64_INIT(0);	// 递增的run_id
+static DEFINE_PER_CPU(int, bpf_trace_active);
+static DEFINE_PER_CPU(u64, bpf_trace_current_run_id);	// 当前bpf程序这一次运行的run_id
+DEFINE_PER_CPU(u32, bpf_trace_current_prog_id);		// 当前bpf程序这一次运行的prog_id
+EXPORT_SYMBOL_GPL(bpf_trace_current_prog_id);
+
+/* 先声明原型，满足编译器的强制规则 */
+void bpf_interp_hook_start(u64 run_id, u32 prog_id);
+void bpf_interp_hook_step(u64 run_id, const u64 *regs);
+void bpf_interp_hook_end(u64 run_id, u64 ret);
+
+/* 定义三个 noinline 的空函数作为 fentry hook 点。
+ * asm("") 防止编译器将其作为死代码优化掉。
+ */
+/* 强制编译器遵循标准的 ABI 传参调用约定 */
+noinline void bpf_interp_hook_start(u64 run_id, u32 prog_id) {
+	asm volatile("" : : "r"(run_id), "r"(prog_id) : "memory");
+}
+noinline void bpf_interp_hook_step(u64 run_id, const u64 *regs) {
+	asm volatile("" : : "r"(run_id), "r"(regs) : "memory");
+}
+noinline void bpf_interp_hook_end(u64 run_id, u64 ret) {
+	asm volatile("" : : "r"(run_id), "r"(ret) : "memory");
+}
 
 /* No hurry in this branch
  *
@@ -1745,7 +1771,7 @@ bool bpf_opcode_in_insntable(u8 code)
  *
  * Return: whatever value is in %BPF_R0 at program exit
  */
-static u64 ___bpf_prog_run(u64 *regs, const struct bpf_insn *insn)
+static u64 ___bpf_prog_run(u64 *regs, const struct bpf_insn *insn, u64 run_id)
 {
 #define BPF_INSN_2_LBL(x, y)    [BPF_##x | BPF_##y] = &&x##_##y
 #define BPF_INSN_3_LBL(x, y, z) [BPF_##x | BPF_##y | BPF_##z] = &&x##_##y##_##z
@@ -1769,8 +1795,23 @@ static u64 ___bpf_prog_run(u64 *regs, const struct bpf_insn *insn)
 #undef BPF_INSN_2_LBL
 	volatile u32 tail_call_cnt = 0;
 
-#define CONT	 ({ insn++; goto select_insn; })
-#define CONT_JMP ({ insn++; goto select_insn; })
+#define CONT ({ \
+	if (unlikely(!this_cpu_read(bpf_trace_active))) { \
+		this_cpu_write(bpf_trace_active, 1); \
+		bpf_interp_hook_step(run_id, regs); \
+		this_cpu_write(bpf_trace_active, 0); \
+	} \
+	insn++; goto select_insn; \
+})
+
+#define CONT_JMP ({ \
+	if (unlikely(!this_cpu_read(bpf_trace_active))) { \
+		this_cpu_write(bpf_trace_active, 1); \
+		bpf_interp_hook_step(run_id, regs); \
+		this_cpu_write(bpf_trace_active, 0); \
+	} \
+	insn++; goto select_insn; \
+})
 
 select_insn:
 	goto *jumptable[insn->code];
@@ -2315,11 +2356,38 @@ static unsigned int PROG_NAME(stack_size)(const void *ctx, const struct bpf_insn
 { \
 	u64 stack[stack_size / sizeof(u64)]; \
 	u64 regs[MAX_BPF_EXT_REG] = {}; \
+	u64 old_run_id, current_run_id; \
+	u32 prog_id; \
+	u64 ret; \
 \
 	kmsan_unpoison_memory(stack, sizeof(stack)); \
 	FP = (u64) (unsigned long) &stack[ARRAY_SIZE(stack)]; \
 	ARG1 = (u64) (unsigned long) ctx; \
-	return ___bpf_prog_run(regs, insn); \
+\
+	old_run_id = this_cpu_read(bpf_trace_current_run_id); \
+	current_run_id = atomic64_inc_return(&bpf_trace_run_id); \
+	this_cpu_write(bpf_trace_current_run_id, current_run_id); \
+	prog_id = this_cpu_read(bpf_trace_current_prog_id); \
+\
+	/* B. 触发 START Hook */ \
+	if (likely(!this_cpu_read(bpf_trace_active))) { \
+		this_cpu_write(bpf_trace_active, 1); \
+		bpf_interp_hook_start(current_run_id, prog_id); \
+		this_cpu_write(bpf_trace_active, 0); \
+	} \
+\
+	/* C. 执行 BPF 主程序 */ \
+	ret = ___bpf_prog_run(regs, insn, current_run_id); \
+\
+	/* D. 触发 END Hook */ \
+	if (likely(!this_cpu_read(bpf_trace_active))) { \
+		this_cpu_write(bpf_trace_active, 1); \
+		bpf_interp_hook_end(current_run_id, ret); \
+		this_cpu_write(bpf_trace_active, 0); \
+	} \
+\
+	this_cpu_write(bpf_trace_current_run_id, old_run_id); \
+	return ret; \
 }
 
 #define PROG_NAME_ARGS(stack_size) __bpf_prog_run_args##stack_size
@@ -2329,6 +2397,7 @@ static u64 PROG_NAME_ARGS(stack_size)(u64 r1, u64 r2, u64 r3, u64 r4, u64 r5, \
 { \
 	u64 stack[stack_size / sizeof(u64)]; \
 	u64 regs[MAX_BPF_EXT_REG]; \
+	u64 current_run_id; \
 \
 	kmsan_unpoison_memory(stack, sizeof(stack)); \
 	FP = (u64) (unsigned long) &stack[ARRAY_SIZE(stack)]; \
@@ -2337,7 +2406,8 @@ static u64 PROG_NAME_ARGS(stack_size)(u64 r1, u64 r2, u64 r3, u64 r4, u64 r5, \
 	BPF_R3 = r3; \
 	BPF_R4 = r4; \
 	BPF_R5 = r5; \
-	return ___bpf_prog_run(regs, insn); \
+	current_run_id = this_cpu_read(bpf_trace_current_run_id); \
+	return ___bpf_prog_run(regs, insn, current_run_id); \
 }
 
 #define EVAL1(FN, X) FN(X)
