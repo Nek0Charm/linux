@@ -2356,37 +2356,49 @@ static unsigned int PROG_NAME(stack_size)(const void *ctx, const struct bpf_insn
 { \
 	u64 stack[stack_size / sizeof(u64)]; \
 	u64 regs[MAX_BPF_EXT_REG] = {}; \
-	u64 old_run_id, current_run_id; \
+	u64 old_run_id, current_run_id = 0; \
 	const struct bpf_prog *prog_ptr; \
+	bool is_target = false; \
 	u64 ret; \
 \
 	kmsan_unpoison_memory(stack, sizeof(stack)); \
 	FP = (u64) (unsigned long) &stack[ARRAY_SIZE(stack)]; \
 	ARG1 = (u64) (unsigned long) ctx; \
 \
-	old_run_id = this_cpu_read(bpf_trace_current_run_id); \
-	current_run_id = atomic64_inc_return(&bpf_trace_run_id); \
-	this_cpu_write(bpf_trace_current_run_id, current_run_id); \
 	prog_ptr = this_cpu_read(bpf_trace_current_prog_ptr); \
 \
-	/* B. 触发 START Hook */ \
-	if (likely(!this_cpu_read(bpf_trace_active))) { \
+	/* A. 精准过滤：未被递归锁住 + 是正常的 eBPF 程序 + 只在 test_progs 进程中记录 */ \
+	if (likely(!this_cpu_read(bpf_trace_active)) && \
+	    prog_ptr && prog_ptr->aux && prog_ptr->aux->id > 0 && \
+	    strncmp(current->comm, "test_progs", 10) == 0) { \
+		is_target = true; \
+		current_run_id = atomic64_inc_return(&bpf_trace_run_id); \
+	} \
+\
+	/* B. 压栈传递给内部调用的 run_id */ \
+	old_run_id = this_cpu_read(bpf_trace_current_run_id); \
+	this_cpu_write(bpf_trace_current_run_id, current_run_id); \
+\
+	/* C. 触发 START Hook (仅目标程序) */ \
+	if (unlikely(is_target)) { \
 		this_cpu_write(bpf_trace_active, 1); \
 		bpf_interp_hook_start(current_run_id, prog_ptr); \
 		this_cpu_write(bpf_trace_active, 0); \
 	} \
 \
-	/* C. 执行 BPF 主程序 */ \
+	/* D. 执行 BPF 主程序，传入 current_run_id (目标程序 >0，非目标程序 ==0) */ \
 	ret = ___bpf_prog_run(regs, insn, current_run_id); \
 \
-	/* D. 触发 END Hook */ \
-	if (likely(!this_cpu_read(bpf_trace_active))) { \
+	/* E. 触发 END Hook (仅目标程序) */ \
+	if (unlikely(is_target)) { \
 		this_cpu_write(bpf_trace_active, 1); \
 		bpf_interp_hook_end(current_run_id, ret); \
 		this_cpu_write(bpf_trace_active, 0); \
 	} \
 \
+	/* F. 恢复旧的 run_id */ \
 	this_cpu_write(bpf_trace_current_run_id, old_run_id); \
+\
 	return ret; \
 }
 
