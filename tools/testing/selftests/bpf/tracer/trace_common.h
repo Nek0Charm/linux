@@ -28,7 +28,7 @@ struct evt_prog_start {
 /* STEP 事件：寄存器快照 */
 struct evt_trace_step {
 	struct trace_hdr hdr;
-	__u64 regs[11]; // BPF_R0 到 BPF_R10
+	__u64 regs[12]; // BPF_R0 ~ BPF_R10 + BPF_RAX
 };
 
 /* END 事件：执行结束 */

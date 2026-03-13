@@ -82,9 +82,8 @@ static int handle_event(void *ctx, void *data, size_t data_sz)
 		fprintf(run->tmp_fp, "    \"prog_insn\": [\n");
 		__u32 print_cnt = (evt->insn_cnt > MAX_INSN_DUMP) ? MAX_INSN_DUMP : evt->insn_cnt;
 		for (__u32 i = 0; i < print_cnt; i++) {
-			fprintf(run->tmp_fp, "      {\"code\": %u, \"dst\": %u, \"src\": %u, \"off\": %d, \"imm\": %d}%s\n",
-				evt->insns[i].code, evt->insns[i].dst_reg, evt->insns[i].src_reg, evt->insns[i].off, evt->insns[i].imm,
-				(i == print_cnt - 1) ? "" : ",");
+			fprintf(run->tmp_fp, "      \"0x%llX\"%s\n",
+				evt->insns[i], (i == print_cnt - 1) ? "" : ",");
 		}
 		fprintf(run->tmp_fp, "    ],\n");
 		fprintf(run->tmp_fp, "    \"trace\": [\n");
@@ -100,8 +99,8 @@ static int handle_event(void *ctx, void *data, size_t data_sz)
 		
 		/* 打印寄存器快照 */
 		fprintf(run->tmp_fp, "      [");
-		for (int i = 0; i < 11; i++) {
-			fprintf(run->tmp_fp, "%llu%s", evt->regs[i], (i == 10) ? "" : ", ");
+		for (int i = 0; i <= 11; i++) {
+			fprintf(run->tmp_fp, "\"0x%llX\"%s", evt->regs[i], (i == 11) ? "" : ", ");
 		}
 		fprintf(run->tmp_fp, "]");
 
