@@ -75,11 +75,11 @@ bool bpf_global_ma_set;
 static atomic64_t bpf_trace_run_id = ATOMIC64_INIT(0);	// 递增的run_id
 static DEFINE_PER_CPU(int, bpf_trace_active);
 static DEFINE_PER_CPU(u64, bpf_trace_current_run_id);	// 当前bpf程序这一次运行的run_id
-DEFINE_PER_CPU(u32, bpf_trace_current_prog_id);		// 当前bpf程序这一次运行的prog_id
-EXPORT_SYMBOL_GPL(bpf_trace_current_prog_id);
+DEFINE_PER_CPU(const struct bpf_prog *, bpf_trace_current_prog_ptr);
+EXPORT_SYMBOL_GPL(bpf_trace_current_prog_ptr);
 
 /* 先声明原型，满足编译器的强制规则 */
-void bpf_interp_hook_start(u64 run_id, u32 prog_id);
+void bpf_interp_hook_start(u64 run_id, const struct bpf_prog *prog);
 void bpf_interp_hook_step(u64 run_id, const u64 *regs);
 void bpf_interp_hook_end(u64 run_id, u64 ret);
 
@@ -87,8 +87,8 @@ void bpf_interp_hook_end(u64 run_id, u64 ret);
  * asm("") 防止编译器将其作为死代码优化掉。
  */
 /* 强制编译器遵循标准的 ABI 传参调用约定 */
-noinline void bpf_interp_hook_start(u64 run_id, u32 prog_id) {
-	asm volatile("" : : "r"(run_id), "r"(prog_id) : "memory");
+noinline void bpf_interp_hook_start(u64 run_id, const struct bpf_prog *prog) {
+	asm volatile("" : : "r"(run_id), "r"(prog) : "memory");
 }
 noinline void bpf_interp_hook_step(u64 run_id, const u64 *regs) {
 	asm volatile("" : : "r"(run_id), "r"(regs) : "memory");
@@ -2357,7 +2357,7 @@ static unsigned int PROG_NAME(stack_size)(const void *ctx, const struct bpf_insn
 	u64 stack[stack_size / sizeof(u64)]; \
 	u64 regs[MAX_BPF_EXT_REG] = {}; \
 	u64 old_run_id, current_run_id; \
-	u32 prog_id; \
+	const struct bpf_prog *prog_ptr; \
 	u64 ret; \
 \
 	kmsan_unpoison_memory(stack, sizeof(stack)); \
@@ -2367,12 +2367,12 @@ static unsigned int PROG_NAME(stack_size)(const void *ctx, const struct bpf_insn
 	old_run_id = this_cpu_read(bpf_trace_current_run_id); \
 	current_run_id = atomic64_inc_return(&bpf_trace_run_id); \
 	this_cpu_write(bpf_trace_current_run_id, current_run_id); \
-	prog_id = this_cpu_read(bpf_trace_current_prog_id); \
+	prog_ptr = this_cpu_read(bpf_trace_current_prog_ptr); \
 \
 	/* B. 触发 START Hook */ \
 	if (likely(!this_cpu_read(bpf_trace_active))) { \
 		this_cpu_write(bpf_trace_active, 1); \
-		bpf_interp_hook_start(current_run_id, prog_id); \
+		bpf_interp_hook_start(current_run_id, prog_ptr); \
 		this_cpu_write(bpf_trace_active, 0); \
 	} \
 \

@@ -1,6 +1,8 @@
 #ifndef __TRACE_COMMON_H
 #define __TRACE_COMMON_H
 
+#define MAX_INSN_DUMP 2048 // 最多抓取 2048 条原始指令 (16KB)
+
 /* 事件类型枚举 */
 enum trace_evt_type {
 	EVT_PROG_START = 1,
@@ -18,6 +20,9 @@ struct trace_hdr {
 struct evt_prog_start {
 	struct trace_hdr hdr;
 	__u32 prog_id;
+	__u32 insn_cnt;
+	char prog_name[16];
+	struct bpf_insn insns[MAX_INSN_DUMP];
 };
 
 /* STEP 事件：寄存器快照 */

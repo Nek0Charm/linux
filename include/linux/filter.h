@@ -39,7 +39,7 @@ struct sock_reuseport;
 struct ctl_table;
 struct ctl_table_header;
 
-DECLARE_PER_CPU(u32, bpf_trace_current_prog_id);
+DECLARE_PER_CPU(const struct bpf_prog *, bpf_trace_current_prog_ptr);
 
 /* ArgX, context and stack frame pointer register positions. Note,
  * Arg1, Arg2, Arg3, etc are used as argument mappings of function
@@ -704,12 +704,12 @@ static __always_inline u32 __bpf_prog_run(const struct bpf_prog *prog,
 					  bpf_dispatcher_fn dfunc)
 {
 	u32 ret;
-	u32 old_prog_id;
+	const struct bpf_prog *old_prog;
 
 	cant_migrate();
-	old_prog_id = this_cpu_read(bpf_trace_current_prog_id);
+	old_prog = this_cpu_read(bpf_trace_current_prog_ptr);
 	if (prog && prog->aux)
-		this_cpu_write(bpf_trace_current_prog_id, prog->aux->id);
+		this_cpu_write(bpf_trace_current_prog_ptr, prog);
 
 	if (static_branch_unlikely(&bpf_stats_enabled_key)) {
 		struct bpf_prog_stats *stats;
@@ -729,7 +729,7 @@ static __always_inline u32 __bpf_prog_run(const struct bpf_prog *prog,
 	} else {
 		ret = dfunc(ctx, prog->insnsi, prog->bpf_func);
 	}
-	this_cpu_write(bpf_trace_current_prog_id, old_prog_id);
+	this_cpu_write(bpf_trace_current_prog_ptr, old_prog);
 	return ret;
 }
 

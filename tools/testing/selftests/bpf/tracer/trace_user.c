@@ -71,45 +71,24 @@ static int handle_event(void *ctx, void *data, size_t data_sz)
 		struct evt_prog_start *evt = data;
 		run = get_or_create_run(hdr->run_id);
 		
-		/* 1. 根据 prog_id 拉取内核中的静态信息 */
-		int prog_fd = bpf_prog_get_fd_by_id(evt->prog_id);
-		struct bpf_prog_info info = {};
-		__u32 info_len = sizeof(info);
-		struct bpf_insn *insns = NULL;
-		
-		if (prog_fd >= 0) {
-			bpf_obj_get_info_by_fd(prog_fd, &info, &info_len);
-			// 二次拉取：分配内存获取完整字节码
-			insns = malloc(info.xlated_prog_len);
-			memset(&info, 0, sizeof(info)); // 重置 info
-			info.xlated_prog_len = info_len; // 告诉内核我们分配了多少空间
-			info.xlated_prog_insns = (__u64)insns;
-			bpf_obj_get_info_by_fd(prog_fd, &info, &info_len);
-		}
-
 		/* 2. 将这次执行的基础信息和静态指令写入它的专属临时文件 */
 		fprintf(run->tmp_fp, "  {\n");
 		fprintf(run->tmp_fp, "    \"run_id\": %llu,\n", hdr->run_id);
 		fprintf(run->tmp_fp, "    \"prog_id\": %u,\n", evt->prog_id);
-		fprintf(run->tmp_fp, "    \"prog_name\": \"%s\",\n", info.name);
-		fprintf(run->tmp_fp, "    \"prog_insn_cnt\": %u,\n", info.xlated_prog_len / 8);
+		fprintf(run->tmp_fp, "    \"prog_name\": \"%s\",\n", evt->prog_name);
+		fprintf(run->tmp_fp, "    \"prog_insn_cnt\": %u,\n", evt->insn_cnt);
 		
 		// 打印静态指令数组 (prog_insn)
 		fprintf(run->tmp_fp, "    \"prog_insn\": [\n");
-		__u32 insn_cnt = info.xlated_prog_len / 8;
-		for (__u32 i = 0; i < insn_cnt; i++) {
+		__u32 print_cnt = (evt->insn_cnt > MAX_INSN_DUMP) ? MAX_INSN_DUMP : evt->insn_cnt;
+		for (__u32 i = 0; i < print_cnt; i++) {
 			fprintf(run->tmp_fp, "      {\"code\": %u, \"dst\": %u, \"src\": %u, \"off\": %d, \"imm\": %d}%s\n",
-				insns[i].code, insns[i].dst_reg, insns[i].src_reg, insns[i].off, insns[i].imm,
-				(i == insn_cnt - 1) ? "" : ",");
+				evt->insns[i].code, evt->insns[i].dst_reg, evt->insns[i].src_reg, evt->insns[i].off, evt->insns[i].imm,
+				(i == print_cnt - 1) ? "" : ",");
 		}
 		fprintf(run->tmp_fp, "    ],\n");
-		
-		// 开启 trace 数组
 		fprintf(run->tmp_fp, "    \"trace\": [\n");
 		
-		if (insns) free(insns);
-		if (prog_fd >= 0) close(prog_fd);
-
 	} else if (hdr->type == EVT_TRACE_STEP) {
 		struct evt_trace_step *evt = data;
 		run = get_or_create_run(hdr->run_id); // 以防万一 START 丢包
