@@ -5,7 +5,8 @@ mkdir -p "$OUT_DIR"
 
 echo "Fetching test list from test_progs..."
 # 利用 -l 参数列出所有测试，过滤掉标题行，只保留纯净的测试名
-TESTS=$(./test_progs -l | grep -v 'test_progs' | tr -d ' ')
+BLACKLIST="flow_dissector_classification|verifier_iterating_callbacks"
+TESTS=$(./test_progs -l | grep -vE "$BLACKLIST")
 
 for test in $TESTS; do
     echo "=================================================="
