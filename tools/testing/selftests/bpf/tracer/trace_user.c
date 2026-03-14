@@ -1,3 +1,4 @@
+#include <signal.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -22,6 +23,12 @@ struct active_run {
 static struct active_run *run_list_head = NULL;
 static FILE *main_json_fp = NULL;
 static bool is_first_run_in_main = true;
+static volatile bool exiting = false;
+
+static void sig_handler(int sig)
+{
+	exiting = true;
+}
 
 /* 查找或创建活跃会话 */
 static struct active_run *get_or_create_run(__u64 run_id) {
@@ -138,8 +145,18 @@ int main(int argc, char **argv)
 	struct ring_buffer *rb = NULL;
 	int err;
 
+	/* 1. 支持通过命令行参数指定输出文件 */
+	const char *out_file = MAIN_JSON_FILE;
+	if (argc > 1) {
+		out_file = argv[1];
+	}
+
+	/* 2. 捕获 Ctrl+C (SIGINT) 和 kill (SIGTERM) 信号 */
+	signal(SIGINT, sig_handler);
+	signal(SIGTERM, sig_handler);
+
 	/* 1. 初始化总 JSON 文件 */
-	main_json_fp = fopen(MAIN_JSON_FILE, "w");
+	main_json_fp = fopen(out_file, "w");
 	fprintf(main_json_fp, "[\n"); // 数组开头
 
 	/* 2. 打开并加载 eBPF 骨架 */
@@ -166,15 +183,21 @@ int main(int argc, char **argv)
 	printf("Tracing BPF programs... Outputting to %s. Hit Ctrl-C to stop.\n", MAIN_JSON_FILE);
 
 	/* 5. 持续轮询，消费内核吐出的数据 */
-	while (1) {
-		err = ring_buffer__poll(rb, 100 /* 超时时间 ms */);
+	while (!exiting) {
+		err = ring_buffer__poll(rb, 100);
 		if (err < 0) {
+			if (err == -EINTR) continue; // 忽略被信号打断的 poll
 			printf("Error polling ring buffer: %d\n", err);
 			break;
 		}
 	}
 
 cleanup:
+	/* 核心修复：退出循环后，一口气把 Ring Buffer 里残留的数据全部强行拉取完 */
+	if (rb) {
+		ring_buffer__consume(rb);
+	}
+
 	/* 优雅退出：闭合 JSON 数组 */
 	if (main_json_fp) {
 		fprintf(main_json_fp, "\n]\n");
