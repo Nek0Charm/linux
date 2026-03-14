@@ -9,7 +9,7 @@ struct {
 } rb SEC(".maps");
 
 SEC("fentry/bpf_interp_hook_start")
-int BPF_PROG(on_start, u64 run_id, const struct bpf_prog *prog)
+int BPF_PROG(on_start, u64 run_id, const struct bpf_prog *prog, u64 ctx_ptr, u64 fp)
 {
 	if (!prog) return 0;
 
@@ -18,6 +18,8 @@ int BPF_PROG(on_start, u64 run_id, const struct bpf_prog *prog)
 
 	evt->hdr.run_id = run_id;
 	evt->hdr.type = EVT_PROG_START;
+	evt->ctx_ptr = ctx_ptr;
+	evt->sp = fp;
 	
 	/* 1. 安全读取 prog->aux 指针 */
 	struct bpf_prog_aux *aux = NULL;
@@ -70,6 +72,20 @@ int BPF_PROG(on_end, u64 run_id, u64 ret)
 	evt->hdr.run_id = run_id;
 	evt->hdr.type = EVT_PROG_END;
 	evt->ret_val = ret;
+	
+	bpf_ringbuf_submit(evt, 0);
+	return 0;
+}
+
+SEC("fentry/bpf_interp_hook_call")
+int BPF_PROG(on_call, u64 run_id, u64 fp)
+{
+	struct evt_prog_call *evt = bpf_ringbuf_reserve(&rb, sizeof(*evt), 0);
+	if (!evt) return 0;
+
+	evt->hdr.run_id = run_id;
+	evt->hdr.type = EVT_PROG_CALL;
+	evt->sp = fp;
 	
 	bpf_ringbuf_submit(evt, 0);
 	return 0;

@@ -8,6 +8,7 @@ enum trace_evt_type {
 	EVT_PROG_START = 1,
 	EVT_TRACE_STEP = 2,
 	EVT_PROG_END   = 3,
+	EVT_PROG_CALL  = 4, // 新增内部调用事件
 };
 
 /* 基础事件头 */
@@ -21,6 +22,8 @@ struct evt_prog_start {
 	struct trace_hdr hdr;
 	__u32 prog_id;
 	__u32 insn_cnt;
+	__u64 ctx_ptr;      // 主程序入口的 R1
+	__u64 sp;           // 主程序的 R10
 	char prog_name[16];
 	struct bpf_insn insns[MAX_INSN_DUMP];
 };
@@ -35,6 +38,11 @@ struct evt_trace_step {
 struct evt_prog_end {
 	struct trace_hdr hdr;
 	__u64 ret_val;
+};
+
+struct evt_prog_call {
+	struct trace_hdr hdr;
+	__u64 sp;           // 内部调用的 R10
 };
 
 #endif /* __TRACE_COMMON_H */

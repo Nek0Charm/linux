@@ -10,6 +10,7 @@
 #include "trace_prog.skel.h" // 由 bpftool gen skeleton 生成
 
 #define MAIN_JSON_FILE "bpf_trace_results.json"
+#define MAX_CALL_RECORD 64
 
 /* 用链表维护当前正在活跃的 run_id 会话 */
 struct active_run {
@@ -17,6 +18,9 @@ struct active_run {
 	FILE *tmp_fp;
 	char tmp_filename[64];
 	bool is_first_step;
+	/* 新增：缓存当前执行流中的所有 bpf2bpf call SP */
+	__u64 sp_list[MAX_CALL_RECORD];
+	int sp_cnt;
 	struct active_run *next;
 };
 
@@ -42,6 +46,7 @@ static struct active_run *get_or_create_run(__u64 run_id) {
 	struct active_run *new_run = malloc(sizeof(*new_run));
 	new_run->run_id = run_id;
 	new_run->is_first_step = true;
+	new_run->sp_cnt = 0; // 初始化内部调用计数
 	snprintf(new_run->tmp_filename, sizeof(new_run->tmp_filename), "/tmp/bpf_run_%llu.tmp", run_id);
 	new_run->tmp_fp = fopen(new_run->tmp_filename, "w+");
 	
@@ -84,7 +89,11 @@ static int handle_event(void *ctx, void *data, size_t data_sz)
 		fprintf(run->tmp_fp, "    \"prog_id\": %u,\n", evt->prog_id);
 		fprintf(run->tmp_fp, "    \"prog_name\": \"%s\",\n", evt->prog_name);
 		fprintf(run->tmp_fp, "    \"prog_insn_cnt\": %u,\n", evt->insn_cnt);
-		
+		fprintf(run->tmp_fp, "    \"ctx_ptr\": \"0x%llX\",\n", evt->ctx_ptr);
+		/* 记录内部调用的 SP 到内存数组，拦截其进入 trace 流 */
+		if (run->sp_cnt < MAX_CALL_RECORD) {
+			run->sp_list[run->sp_cnt++] = evt->sp;
+		}
 		// 打印静态指令数组 (prog_insn)
 		fprintf(run->tmp_fp, "    \"prog_insn\": [\n");
 		__u32 print_cnt = (evt->insn_cnt > MAX_INSN_DUMP) ? MAX_INSN_DUMP : evt->insn_cnt;
@@ -115,11 +124,20 @@ static int handle_event(void *ctx, void *data, size_t data_sz)
 		struct evt_prog_end *evt = data;
 		run = get_or_create_run(hdr->run_id);
 		
-		/* 1. 闭合当前 run 的 JSON 结构 */
-		fprintf(run->tmp_fp, "\n    ]\n  }");
+		/* 1. 先闭合 trace 的纯净数组 */
+		fprintf(run->tmp_fp, "\n    ],\n");
+		
+		/* 2. 生成平级的 sp_list 数组 */
+		fprintf(run->tmp_fp, "    \"sp_list\": [");
+		for (int i = 0; i < run->sp_cnt; i++) {
+			fprintf(run->tmp_fp, "\"0x%llX\"%s", 
+				run->sp_list[i], 
+				(i == run->sp_cnt - 1) ? "" : ", ");
+		}
+		fprintf(run->tmp_fp, "]\n  }");
 		fflush(run->tmp_fp);
 		
-		/* 2. 将完整的这个 Run 合并到总 JSON 文件中 */
+		/* 3. 将完整的这个 Run 合并到总 JSON 文件中 */
 		if (!is_first_run_in_main) {
 			fprintf(main_json_fp, ",\n");
 		}
@@ -135,6 +153,14 @@ static int handle_event(void *ctx, void *data, size_t data_sz)
 		
 		/* 3. 清理会话和临时文件 */
 		remove_run(hdr->run_id);
+	} else if (hdr->type == EVT_PROG_CALL) {
+		struct evt_prog_call *evt = data;
+		run = get_or_create_run(hdr->run_id); 
+		
+		/* 记录内部调用的 SP 到内存数组，拦截其进入 trace 流 */
+		if (run->sp_cnt < MAX_CALL_RECORD) {
+			run->sp_list[run->sp_cnt++] = evt->sp;
+		}
 	}
 	return 0;
 }

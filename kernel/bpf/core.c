@@ -79,22 +79,26 @@ DEFINE_PER_CPU(const struct bpf_prog *, bpf_trace_current_prog_ptr);
 EXPORT_SYMBOL_GPL(bpf_trace_current_prog_ptr);
 
 /* 先声明原型，满足编译器的强制规则 */
-void bpf_interp_hook_start(u64 run_id, const struct bpf_prog *prog);
+void bpf_interp_hook_start(u64 run_id, const struct bpf_prog *prog, u64 ctx_ptr, u64 fp);
 void bpf_interp_hook_step(u64 run_id, const u64 *regs);
 void bpf_interp_hook_end(u64 run_id, u64 ret);
+void bpf_interp_hook_call(u64 run_id, u64 fp);
 
 /* 定义三个 noinline 的空函数作为 fentry hook 点。
  * asm("") 防止编译器将其作为死代码优化掉。
  */
 /* 强制编译器遵循标准的 ABI 传参调用约定 */
-noinline void bpf_interp_hook_start(u64 run_id, const struct bpf_prog *prog) {
-	asm volatile("" : : "r"(run_id), "r"(prog) : "memory");
+noinline void bpf_interp_hook_start(u64 run_id, const struct bpf_prog *prog, u64 ctx_ptr, u64 fp) {
+	asm volatile("" : : "r"(run_id), "r"(prog), "r"(ctx_ptr), "r"(fp) : "memory");
 }
 noinline void bpf_interp_hook_step(u64 run_id, const u64 *regs) {
 	asm volatile("" : : "r"(run_id), "r"(regs) : "memory");
 }
 noinline void bpf_interp_hook_end(u64 run_id, u64 ret) {
 	asm volatile("" : : "r"(run_id), "r"(ret) : "memory");
+}
+noinline void bpf_interp_hook_call(u64 run_id, u64 fp) {
+	asm volatile("" : : "r"(run_id), "r"(fp) : "memory");
 }
 
 /* No hurry in this branch
@@ -2382,7 +2386,8 @@ static unsigned int PROG_NAME(stack_size)(const void *ctx, const struct bpf_insn
 	/* C. 触发 START Hook (仅目标程序) */ \
 	if (unlikely(is_target)) { \
 		this_cpu_write(bpf_trace_active, 1); \
-		bpf_interp_hook_start(current_run_id, prog_ptr); \
+		/* 传入 ctx (作为 R1) 和 FP (作为 R10) */ \
+		bpf_interp_hook_start(current_run_id, prog_ptr, ARG1, FP); \
 		this_cpu_write(bpf_trace_active, 0); \
 	} \
 \
@@ -2419,6 +2424,14 @@ static u64 PROG_NAME_ARGS(stack_size)(u64 r1, u64 r2, u64 r3, u64 r4, u64 r5, \
 	BPF_R4 = r4; \
 	BPF_R5 = r5; \
 	current_run_id = this_cpu_read(bpf_trace_current_run_id); \
+\
+	/* 新增：追踪内部函数调用 (bpf2bpf)，共用主程序的 current_run_id */ \
+	if (unlikely(current_run_id > 0 && !this_cpu_read(bpf_trace_active))) { \
+		this_cpu_write(bpf_trace_active, 1); \
+		bpf_interp_hook_call(current_run_id, FP); \
+		this_cpu_write(bpf_trace_active, 0); \
+	} \
+\
 	return ___bpf_prog_run(regs, insn, current_run_id); \
 }
 
