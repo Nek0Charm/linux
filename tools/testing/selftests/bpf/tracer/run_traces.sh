@@ -1,35 +1,76 @@
 #!/bin/bash
 
+# --- Configuration ---
+# Script location: ./tools/testing/selftests/bpf/tracer/
 OUT_DIR="bpf_trace"
+TEST_PROGS_BIN="../test_progs"
+TRACE_USER="./trace_user"
+BLACKLIST="flow_dissector_classification|verifier_iterating_callbacks"
+
+# 1. Validation: Check if necessary files exist
+if [ ! -x "$TEST_PROGS_BIN" ]; then
+    echo "Error: $TEST_PROGS_BIN not found or not executable."
+    exit 1
+fi
+
+if [ ! -x "$TRACE_USER" ]; then
+    echo "Error: $TRACE_USER not found or not executable."
+    exit 1
+fi
+
 mkdir -p "$OUT_DIR"
 
-echo "Fetching test list from test_progs..."
-# 利用 -l 参数列出所有测试，过滤掉标题行，只保留纯净的测试名
-BLACKLIST="flow_dissector_classification|verifier_iterating_callbacks"
-TESTS=$(./test_progs -l | grep -vE "$BLACKLIST")
+# 2. Argument Handling & List Fetching
+if [ $# -gt 0 ]; then
+    TESTS="$@"
+    echo "Running specified tests: $TESTS"
+else
+    echo "Fetching test list from $TEST_PROGS_BIN..."
+    TESTS=$($TEST_PROGS_BIN -l | grep -vE "$BLACKLIST")
+fi
 
+# 3. Execution Loop
 for test in $TESTS; do
+    # Validation: Check if the test exists (running from tracer dir)
+    if ! $TEST_PROGS_BIN -l | grep -qw "$test"; then
+        echo "Warning: Test '$test' not found. Skipping..."
+        continue
+    fi
+
     echo "=================================================="
     echo "Tracing test: $test"
     
-    # 1. 在后台启动追踪器，指定这个测试专属的 json 文件名
-    ./trace_user "${OUT_DIR}/${test}.json" &
+    # Get absolute path for the JSON output to avoid issues after cd
+    JSON_OUT="$(pwd)/${OUT_DIR}/${test}.json"
+    
+    # 1. Start tracer in background (stays in tracer dir to find trace_user)
+    $TRACE_USER "$JSON_OUT" &
     TRACE_PID=$!
     
-    # 给追踪器 0.5 秒时间加载 BPF skeleton 和挂载 Hook
+    # Give tracer 0.5s to load BPF skeleton
     sleep 0.5
     
-    # 2. 运行单个测试，必须加上 -j1 强制单线程运行，防止并发污染
-    ./test_progs -t "$test" -j1
+    if ! kill -0 $TRACE_PID 2>/dev/null; then
+        echo "Error: Failed to start $TRACE_USER for $test. Skipping..."
+        continue
+    fi
+    
+    # 2. Run test_progs (Switch to parent directory to find BPF objects)
+    # Using subshell ( ) to ensure we return to current dir automatically
+    (
+        cd ..
+        ./test_progs -t "$test" -j1
+    )
 
-    # 【核心修复】：给内核一点喘息的时间，确保所有 trace 已经推入 Ring Buffer
+    # Ensure all traces are pushed into Ring Buffer
     sleep 0.2
     
-    # 3. 测试跑完，发送 SIGINT 信号给追踪器，触发 cleanup 闭合 JSON
+    # 3. Stop tracer and cleanup
     kill -SIGINT $TRACE_PID
     
-    # 等待追踪器彻底落盘并退出
+    # Wait for tracer to exit
     wait $TRACE_PID 2>/dev/null
 done
 
+echo "--------------------------------------------------"
 echo "Done! All traces are perfectly saved in ./$OUT_DIR/"
