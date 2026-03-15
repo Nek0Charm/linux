@@ -11,6 +11,16 @@
 
 #define MAIN_JSON_FILE "bpf_trace_results.json"
 #define MAX_CALL_RECORD 64
+#define MAX_TAILCALL_RECORD 64
+
+struct tailcall_record {
+	__u32 pc;
+	__u64 map_ptr;
+	__u32 index;
+	__u64 prog_ptr;
+	__u32 insn_cnt;
+	struct bpf_insn insns[MAX_INSN_DUMP];
+};
 
 /* 用链表维护当前正在活跃的 run_id 会话 */
 struct active_run {
@@ -21,6 +31,9 @@ struct active_run {
 	/* 新增：缓存当前执行流中的所有 bpf2bpf call SP */
 	__u64 sp_list[MAX_CALL_RECORD];
 	int sp_cnt;
+	/* 新增：缓存所有的尾调用信息 */
+	struct tailcall_record jmp_table[MAX_TAILCALL_RECORD];
+	int jmp_cnt;
 	struct active_run *next;
 };
 
@@ -47,6 +60,7 @@ static struct active_run *get_or_create_run(__u64 run_id) {
 	new_run->run_id = run_id;
 	new_run->is_first_step = true;
 	new_run->sp_cnt = 0; // 初始化内部调用计数
+	new_run->jmp_cnt = 0;
 	snprintf(new_run->tmp_filename, sizeof(new_run->tmp_filename), "/tmp/bpf_run_%llu.tmp", run_id);
 	new_run->tmp_fp = fopen(new_run->tmp_filename, "w+");
 	
@@ -134,7 +148,32 @@ static int handle_event(void *ctx, void *data, size_t data_sz)
 				run->sp_list[i], 
 				(i == run->sp_cnt - 1) ? "" : ", ");
 		}
-		fprintf(run->tmp_fp, "]\n  }");
+		
+		fprintf(run->tmp_fp, "],\n"); // 注意这里加了逗号
+		
+		/* 3. 生成平级的 jmp_table 数组 */
+		fprintf(run->tmp_fp, "    \"jmp_table\": [\n");
+		for (int i = 0; i < run->jmp_cnt; i++) {
+			struct tailcall_record *rec = &run->jmp_table[i];
+			
+			fprintf(run->tmp_fp, "      {\n");
+			fprintf(run->tmp_fp, "        \"pc\": %u,\n", rec->pc);
+			fprintf(run->tmp_fp, "        \"map_ptr\": \"0x%llX\",\n", (unsigned long long)rec->map_ptr);
+			fprintf(run->tmp_fp, "        \"index\": %u,\n", rec->index);
+			fprintf(run->tmp_fp, "        \"target\": \"0x%llX\",\n", (unsigned long long)rec->prog_ptr);
+			fprintf(run->tmp_fp, "        \"insns\": [\n");
+			        
+			__u32 print_cnt = rec->insn_cnt > MAX_INSN_DUMP ? MAX_INSN_DUMP : rec->insn_cnt;
+			for (__u32 j = 0; j < print_cnt; j++) {
+				__u64 raw_insn = *((__u64 *)&rec->insns[j]);
+				fprintf(run->tmp_fp, "          \"0x%llX\"%s\n", 
+				        (unsigned long long)raw_insn, 
+				        (j == print_cnt - 1) ? "" : ",");
+			}
+			/* 闭合 insns 数组和对象 */
+			fprintf(run->tmp_fp, "        ]\n      }%s\n", (i == run->jmp_cnt - 1) ? "" : ",");
+		}
+		fprintf(run->tmp_fp, "    ]\n  }");
 		fflush(run->tmp_fp);
 		
 		/* 3. 将完整的这个 Run 合并到总 JSON 文件中 */
@@ -160,6 +199,21 @@ static int handle_event(void *ctx, void *data, size_t data_sz)
 		/* 记录内部调用的 SP 到内存数组，拦截其进入 trace 流 */
 		if (run->sp_cnt < MAX_CALL_RECORD) {
 			run->sp_list[run->sp_cnt++] = evt->sp;
+		}
+	} else if (hdr->type == EVT_PROG_TAILCALL) {
+		struct evt_prog_tailcall *evt = data;
+		run = get_or_create_run(hdr->run_id); 
+		
+		/* 记录 Tail Call 目标到内存数组 */
+		if (run->jmp_cnt < MAX_TAILCALL_RECORD) {
+			struct tailcall_record *rec = &run->jmp_table[run->jmp_cnt++];
+			rec->pc = evt->pc;
+			rec->map_ptr = evt->map_ptr;
+			rec->index = evt->index;
+			rec->prog_ptr = evt->prog_ptr;
+			rec->insn_cnt = evt->insn_cnt;
+			__u32 copy_cnt = evt->insn_cnt > MAX_INSN_DUMP ? MAX_INSN_DUMP : evt->insn_cnt;
+			memcpy(rec->insns, evt->insns, copy_cnt * sizeof(struct bpf_insn));
 		}
 	}
 	return 0;

@@ -9,6 +9,7 @@ enum trace_evt_type {
 	EVT_TRACE_STEP = 2,
 	EVT_PROG_END   = 3,
 	EVT_PROG_CALL  = 4, // 新增内部调用事件
+	EVT_PROG_TAILCALL = 5,
 };
 
 /* 基础事件头 */
@@ -43,6 +44,16 @@ struct evt_prog_end {
 struct evt_prog_call {
 	struct trace_hdr hdr;
 	__u64 sp;           // 内部调用的 R10
+};
+
+struct evt_prog_tailcall {
+	struct trace_hdr hdr;
+	__u32 pc;            // 发生跳转的 PC
+	__u32 index;         // 尾调用传入的索引 (R3)
+	__u64 map_ptr;       // 尾调用传入的 Map 指针 (R2)
+	__u64 prog_ptr;      // 目标程序的内存地址
+	__u32 insn_cnt;
+	struct bpf_insn insns[MAX_INSN_DUMP];
 };
 
 #endif /* __TRACE_COMMON_H */

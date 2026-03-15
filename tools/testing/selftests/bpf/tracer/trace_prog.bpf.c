@@ -91,4 +91,32 @@ int BPF_PROG(on_call, u64 run_id, u64 fp)
 	return 0;
 }
 
+SEC("fentry/bpf_interp_hook_tailcall")
+int BPF_PROG(on_tailcall, u64 run_id, const struct bpf_prog *prog, u32 pc, u64 map_ptr, u32 index)
+{
+	if (!prog) return 0;
+	
+	struct evt_prog_tailcall *evt = bpf_ringbuf_reserve(&rb, sizeof(*evt), 0);
+	if (!evt) return 0;
+
+	evt->hdr.run_id = run_id;
+	evt->hdr.type = EVT_PROG_TAILCALL;
+	evt->pc = pc;
+	evt->map_ptr = map_ptr;
+	evt->index = index;
+	evt->prog_ptr = (u64)prog;
+	
+	/* 提取指令序列 */
+	bpf_probe_read_kernel(&evt->insn_cnt, sizeof(evt->insn_cnt), &prog->len);
+	__u32 copy_cnt = evt->insn_cnt;
+	if (copy_cnt > MAX_INSN_DUMP) copy_cnt = MAX_INSN_DUMP;
+	
+	if (copy_cnt > 0) {
+		bpf_probe_read_kernel(evt->insns, copy_cnt * sizeof(struct bpf_insn), prog->insnsi);
+	}
+
+	bpf_ringbuf_submit(evt, 0);
+	return 0;
+}
+
 char LICENSE[] SEC("license") = "GPL";

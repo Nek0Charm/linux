@@ -83,6 +83,7 @@ void bpf_interp_hook_start(u64 run_id, const struct bpf_prog *prog, u64 ctx_ptr,
 void bpf_interp_hook_step(u64 run_id, const u64 *regs);
 void bpf_interp_hook_end(u64 run_id, u64 ret);
 void bpf_interp_hook_call(u64 run_id, u64 fp);
+void bpf_interp_hook_tailcall(u64 run_id, const struct bpf_prog *prog, u32 pc, u64 map_ptr, u32 index);
 
 /* 定义三个 noinline 的空函数作为 fentry hook 点。
  * asm("") 防止编译器将其作为死代码优化掉。
@@ -99,6 +100,9 @@ noinline void bpf_interp_hook_end(u64 run_id, u64 ret) {
 }
 noinline void bpf_interp_hook_call(u64 run_id, u64 fp) {
 	asm volatile("" : : "r"(run_id), "r"(fp) : "memory");
+}
+noinline void bpf_interp_hook_tailcall(u64 run_id, const struct bpf_prog *prog, u32 pc, u64 map_ptr, u32 index) {
+	asm volatile("" : : "r"(run_id), "r"(prog), "r"(pc), "r"(map_ptr), "r"(index) : "memory");
 }
 
 /* No hurry in this branch
@@ -1777,6 +1781,7 @@ bool bpf_opcode_in_insntable(u8 code)
  */
 static u64 ___bpf_prog_run(u64 *regs, const struct bpf_insn *insn, u64 run_id)
 {
+	const struct bpf_insn *base_insn = insn; // <--- 新增
 #define BPF_INSN_2_LBL(x, y)    [BPF_##x | BPF_##y] = &&x##_##y
 #define BPF_INSN_3_LBL(x, y, z) [BPF_##x | BPF_##y | BPF_##z] = &&x##_##y##_##z
 	static const void * const jumptable[256] __annotate_jump_table = {
@@ -2125,12 +2130,20 @@ select_insn:
 		/* 2. 记录成功的跳转（记住，执行这行之后，当前程序就一去不复返了） */
 		trace_printk("BPF_TAIL_CALL: SUCCESS - Jumping to new prog (ptr: %p). New cnt: %u\n",
 				prog, tail_call_cnt);
+
+		if (unlikely(run_id > 0 && !this_cpu_read(bpf_trace_active))) {
+			this_cpu_write(bpf_trace_active, 1);
+			/* 将触发本次跳转的 map 指针和 index 一并传出 */
+			bpf_interp_hook_tailcall(run_id, prog, (u32)(insn - base_insn), (u64)map, index);
+			this_cpu_write(bpf_trace_active, 0);
+		}
 		/* ARG1 at this point is guaranteed to point to CTX from
 		 * the verifier side due to the fact that the tail call is
 		 * handled like a helper, that is, bpf_tail_call_proto,
 		 * where arg1_type is ARG_PTR_TO_CTX.
 		 */
 		insn = prog->insnsi;
+		base_insn = insn; // <--- 极其关键：重置新程序的基址！这样后续的 PC 就归零了！
 		goto select_insn; /* 直接把解释器的指令指针（insn）替换掉，重新进入循环 */
 out:
 		/* 3. 记录失败后的“继续执行” (Fallthrough) */
