@@ -28,6 +28,9 @@ struct active_run {
 	FILE *tmp_fp;
 	char tmp_filename[64];
 	bool is_first_step;
+	/* 新增：状态机追踪标志 */
+	bool has_started;
+	bool is_corrupted;
 	/* 新增：缓存当前执行流中的所有 bpf2bpf call SP */
 	__u64 sp_list[MAX_CALL_RECORD];
 	int sp_cnt;
@@ -59,6 +62,8 @@ static struct active_run *get_or_create_run(__u64 run_id) {
 	struct active_run *new_run = malloc(sizeof(*new_run));
 	new_run->run_id = run_id;
 	new_run->is_first_step = true;
+	new_run->has_started = false;  // <--- 新增
+	new_run->is_corrupted = false; // <--- 新增
 	new_run->sp_cnt = 0; // 初始化内部调用计数
 	new_run->jmp_cnt = 0;
 	snprintf(new_run->tmp_filename, sizeof(new_run->tmp_filename), "/tmp/bpf_run_%llu.tmp", run_id);
@@ -97,6 +102,8 @@ static int handle_event(void *ctx, void *data, size_t data_sz)
 		struct evt_prog_start *evt = data;
 		run = get_or_create_run(hdr->run_id);
 		
+		run->has_started = true; // 标记正常启动
+
 		/* 2. 将这次执行的基础信息和静态指令写入它的专属临时文件 */
 		fprintf(run->tmp_fp, "  {\n");
 		fprintf(run->tmp_fp, "    \"run_id\": %llu,\n", hdr->run_id);
@@ -135,6 +142,16 @@ static int handle_event(void *ctx, void *data, size_t data_sz)
 		struct evt_trace_step *evt = data;
 		run = get_or_create_run(hdr->run_id); // 以防万一 START 丢包
 		
+		/* 容错：如果未收到过 START，说明丢包了，标记损坏并跳过 */
+		if (!run->has_started) {
+			if (!run->is_corrupted) {
+				fprintf(stderr, "[Warning] RingBuf Overflow: run_id %llu missing START. Trace will be discarded.\n", hdr->run_id);
+				run->is_corrupted = true;
+			}
+			return 0;
+		}
+		if (run->is_corrupted) return 0;
+
 		if (!run->is_first_step) {
 			fprintf(run->tmp_fp, ",\n");
 		}
@@ -150,6 +167,16 @@ static int handle_event(void *ctx, void *data, size_t data_sz)
 	} else if (hdr->type == EVT_PROG_END) {
 		struct evt_prog_end *evt = data;
 		run = get_or_create_run(hdr->run_id);
+
+		/* 如果整个生命周期没有 START，或者已经被标记损坏 */
+		if (!run->has_started) run->is_corrupted = true;
+		
+		if (run->is_corrupted) {
+			/* 致命错误隔离：绝对不写入闭合标签，绝对不合并到主 JSON */
+			fprintf(stderr, "[Drop] Corrupted trace for run_id %llu discarded cleanly.\n", hdr->run_id);
+			remove_run(hdr->run_id); // 这会关闭并 unlink 临时文件
+			return 0;
+		}
 		
 		/* 1. 先闭合 trace 的纯净数组 */
 		fprintf(run->tmp_fp, "\n    ],\n");
@@ -209,6 +236,9 @@ static int handle_event(void *ctx, void *data, size_t data_sz)
 		struct evt_prog_call *evt = data;
 		run = get_or_create_run(hdr->run_id); 
 		
+		if (!run->has_started) run->is_corrupted = true;
+		if (run->is_corrupted) return 0;
+
 		/* 记录内部调用的 SP 到内存数组，拦截其进入 trace 流 */
 		if (run->sp_cnt < MAX_CALL_RECORD) {
 			run->sp_list[run->sp_cnt++] = evt->sp;
@@ -216,6 +246,9 @@ static int handle_event(void *ctx, void *data, size_t data_sz)
 	} else if (hdr->type == EVT_PROG_TAILCALL) {
 		struct evt_prog_tailcall *evt = data;
 		run = get_or_create_run(hdr->run_id); 
+		
+		if (!run->has_started) run->is_corrupted = true;
+		if (run->is_corrupted) return 0;
 		
 		/* 记录 Tail Call 目标到内存数组 */
 		if (run->jmp_cnt < MAX_TAILCALL_RECORD) {
