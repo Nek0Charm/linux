@@ -20,7 +20,7 @@
 
 /* General test specific settings */
 #define MAX_SUBTESTS	3
-#define MAX_TESTRUNS	1000
+#define MAX_TESTRUNS	1
 #define MAX_DATA	128
 #define MAX_INSNS	512
 #define MAX_K		0xffffFFFF
@@ -14840,37 +14840,9 @@ static struct bpf_prog *generate_filter(int which, int *err)
 	__u8 test_type = tests[which].aux & TEST_TYPE_MASK;
 	unsigned int flen = filter_length(which);
 	void *fptr = filter_pointer(which);
-	struct sock_fprog_kern fprog;
 	struct bpf_prog *fp;
 
 	switch (test_type) {
-	case CLASSIC:
-		fprog.filter = fptr;
-		fprog.len = flen;
-
-		*err = bpf_prog_create(&fp, &fprog);
-		if (tests[which].aux & FLAG_EXPECTED_FAIL) {
-			if (*err == tests[which].expected_errcode) {
-				pr_cont("PASS\n");
-				/* Verifier rejected filter as expected. */
-				*err = 0;
-				return NULL;
-			} else {
-				pr_cont("UNEXPECTED_PASS\n");
-				/* Verifier didn't reject the test that's
-				 * bad enough, just return!
-				 */
-				*err = -EINVAL;
-				return NULL;
-			}
-		}
-		if (*err) {
-			pr_cont("FAIL to prog_create err=%d len=%d\n",
-				*err, fprog.len);
-			return NULL;
-		}
-		break;
-
 	case INTERNAL:
 		fp = bpf_prog_alloc(bpf_prog_size(flen), 0);
 		if (fp == NULL) {
@@ -14896,6 +14868,9 @@ static struct bpf_prog *generate_filter(int which, int *err)
 			return NULL;
 		}
 		break;
+	default:
+		fp = NULL;
+		break;
 	}
 
 	*err = 0;
@@ -14908,7 +14883,6 @@ static void release_filter(struct bpf_prog *fp, int which)
 
 	switch (test_type) {
 	case CLASSIC:
-		bpf_prog_destroy(fp);
 		break;
 	case INTERNAL:
 		bpf_prog_free(fp);

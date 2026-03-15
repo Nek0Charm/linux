@@ -2386,8 +2386,9 @@ static unsigned int PROG_NAME(stack_size)(const void *ctx, const struct bpf_insn
 \
 	/* A. 精准过滤：未被递归锁住 + 是正常的 eBPF 程序 + 只在 test_progs 进程中记录 */ \
 	if (likely(!this_cpu_read(bpf_trace_active)) && \
-	    prog_ptr && prog_ptr->aux && prog_ptr->aux->id > 0 && \
-	    strncmp(current->comm, "test_progs", 10) == 0) { \
+	    prog_ptr && prog_ptr->aux && \
+	    (strncmp(current->comm, "test_progs", 10) == 0 && prog_ptr->aux->id > 0 || \
+	     strncmp(current->comm, "insmod", 6) == 0)) { \
 		is_target = true; \
 		current_run_id = atomic64_inc_return(&bpf_trace_run_id); \
 	} \
