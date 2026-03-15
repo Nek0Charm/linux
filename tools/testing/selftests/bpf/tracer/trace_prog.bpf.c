@@ -35,6 +35,51 @@ int BPF_PROG(on_start, u64 run_id, const struct bpf_prog *prog, u64 ctx_ptr, u64
 		evt->prog_name[0] = '\0';
 	}
 
+	/* ================= 新增：读取 used_maps 生成 mem_blocks ================= */
+	evt->block_cnt = 0;
+	if (aux) {
+		u32 used_map_cnt = 0;
+		bpf_probe_read_kernel(&used_map_cnt, sizeof(used_map_cnt), &aux->used_map_cnt);
+		struct bpf_map **used_maps = NULL;
+		bpf_probe_read_kernel(&used_maps, sizeof(used_maps), &aux->used_maps);
+		
+		if (used_maps && used_map_cnt > 0) {
+			u32 limit = used_map_cnt > 8 ? 8 : used_map_cnt;
+			int b_idx = 0;
+			
+			for (u32 i = 0; i < 8; i++) {
+				if (i >= limit || b_idx >= MAX_MEM_BLOCKS - 1) break;
+				
+				struct bpf_map *map = NULL;
+				bpf_probe_read_kernel(&map, sizeof(map), &used_maps[i]);
+				if (!map) continue;
+
+				/* 块 1: Map FD (不可直接解引用，size设为0) */
+				evt->blocks[b_idx].base_addr = (u64)map;
+				evt->blocks[b_idx].size = 0;
+				evt->blocks[b_idx].is_direct_value = 0;
+				b_idx++;
+
+				/* 块 2: Map Value (仅 Array Map 等支持直接解引用) */
+				u32 map_type = 0;
+				bpf_probe_read_kernel(&map_type, sizeof(map_type), &map->map_type);
+				if (map_type == BPF_MAP_TYPE_ARRAY) {
+					u32 v_size = 0, m_entries = 0;
+					bpf_probe_read_kernel(&v_size, sizeof(v_size), &map->value_size);
+					bpf_probe_read_kernel(&m_entries, sizeof(m_entries), &map->max_entries);
+					
+					/* 计算 value 数组的首地址：利用 vmlinux.h 中的 struct bpf_array */
+					evt->blocks[b_idx].base_addr = (u64)map + __builtin_offsetof(struct bpf_array, value);
+					evt->blocks[b_idx].size = v_size * m_entries;
+					evt->blocks[b_idx].is_direct_value = 1;
+					b_idx++;
+				}
+			}
+			evt->block_cnt = b_idx;
+		}
+	}
+	/* ======================================================================== */
+
 	/* 3. 读取指令数量 prog->len */
 	bpf_probe_read_kernel(&evt->insn_cnt, sizeof(evt->insn_cnt), &prog->len);
 

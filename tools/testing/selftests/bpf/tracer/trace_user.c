@@ -108,6 +108,19 @@ static int handle_event(void *ctx, void *data, size_t data_sz)
 		if (run->sp_cnt < MAX_CALL_RECORD) {
 			run->sp_list[run->sp_cnt++] = evt->sp;
 		}
+
+		/* ================= 新增：输出 mem_blocks ================= */
+		fprintf(run->tmp_fp, "    \"mem_blocks\": [\n");
+		for (__u32 i = 0; i < evt->block_cnt; i++) {
+			fprintf(run->tmp_fp, "      {\n");
+			fprintf(run->tmp_fp, "        \"base_addr\": \"0x%llX\",\n", (unsigned long long)evt->blocks[i].base_addr);
+			fprintf(run->tmp_fp, "        \"size\": %u,\n", evt->blocks[i].size);
+			fprintf(run->tmp_fp, "        \"type\": \"%s\"\n", evt->blocks[i].is_direct_value ? "map_value" : "map_fd");
+			fprintf(run->tmp_fp, "      }%s\n", (i == evt->block_cnt - 1) ? "" : ",");
+		}
+		fprintf(run->tmp_fp, "    ],\n");
+		/* ========================================================= */
+
 		// 打印静态指令数组 (prog_insn)
 		fprintf(run->tmp_fp, "    \"prog_insn\": [\n");
 		__u32 print_cnt = (evt->insn_cnt > MAX_INSN_DUMP) ? MAX_INSN_DUMP : evt->insn_cnt;

@@ -2,6 +2,13 @@
 #define __TRACE_COMMON_H
 
 #define MAX_INSN_DUMP 2048 // 最多抓取 2048 条原始指令 (16KB)
+#define MAX_MEM_BLOCKS 16 // 假设最多 8 个 map，每个 map 产生 fd 和 value 两个块
+
+struct mem_block_info {
+	__u64 base_addr;
+	__u32 size;
+	__u32 is_direct_value;
+};
 
 /* 事件类型枚举 */
 enum trace_evt_type {
@@ -26,6 +33,8 @@ struct evt_prog_start {
 	__u64 ctx_ptr;      // 主程序入口的 R1
 	__u64 sp;           // 主程序的 R10
 	char prog_name[16];
+	__u32 block_cnt;
+	struct mem_block_info blocks[MAX_MEM_BLOCKS];
 	struct bpf_insn insns[MAX_INSN_DUMP];
 };
 
