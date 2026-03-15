@@ -1,18 +1,34 @@
 #!/bin/bash
 
 # --- Configuration ---
-# Script location: ./tools/testing/selftests/bpf/tracer/
-OUT_DIR="bpf_trace"
+OUT_DIR="bpf_trace/test_progs"
 TEST_PROGS_BIN="../test_progs"
 TRACE_USER="./trace_user"
-BLACKLIST="flow_dissector_classification|verifier_iterating_callbacks"
 
-# 1. Validation: Check if necessary files exist
+# --- Blacklist ---
+BLACKLIST_RULES=(
+    "flow_dissector_classification"
+    "flow_dissector_skb"
+    "stream_success"
+    "verifier_iterating_callbacks"
+)
+BLACKLIST=$(IFS='|'; echo "${BLACKLIST_RULES[*]}")
+
+# 1. Root Check
+if [ "$EUID" -ne 0 ]; then
+    echo "Error: Please run as root (or use sudo) to disable BPF JIT."
+    exit 1
+fi
+
+# 2. Environment Setup
+echo "Disabling BPF JIT for consistent tracing..."
+echo 0 | tee /proc/sys/net/core/bpf_jit_enable > /dev/null
+
+# 3. Validation
 if [ ! -x "$TEST_PROGS_BIN" ]; then
     echo "Error: $TEST_PROGS_BIN not found or not executable."
     exit 1
 fi
-
 if [ ! -x "$TRACE_USER" ]; then
     echo "Error: $TRACE_USER not found or not executable."
     exit 1
@@ -20,18 +36,44 @@ fi
 
 mkdir -p "$OUT_DIR"
 
-# 2. Argument Handling & List Fetching
-if [ $# -gt 0 ]; then
-    TESTS="$@"
+# 4. Advanced Argument Handling
+START_FROM=""
+SELECTED_ARGS="$@"
+
+if [ "$1" == "--from" ]; then
+    START_FROM="$2"
+    # Remove the first two arguments (--from <test_name>)
+    shift 2
+    SELECTED_ARGS="$@"
+    echo "Mode: Start execution from '$START_FROM' onwards."
+fi
+
+# 5. Fetch Test List
+if [ -n "$SELECTED_ARGS" ]; then
+    TESTS="$SELECTED_ARGS"
     echo "Running specified tests: $TESTS"
 else
-    echo "Fetching test list from $TEST_PROGS_BIN..."
+    echo "Fetching all tests from $TEST_PROGS_BIN..."
     TESTS=$($TEST_PROGS_BIN -l | grep -vE "$BLACKLIST")
 fi
 
-# 3. Execution Loop
+# 6. Execution Loop
+SHOULD_SKIP=false
+if [ -n "$START_FROM" ]; then
+    SHOULD_SKIP=true
+fi
+
 for test in $TESTS; do
-    # Validation: Check if the test exists (running from tracer dir)
+    # Logic to handle starting from a specific test
+    if [ "$SHOULD_SKIP" = true ]; then
+        if [ "$test" == "$START_FROM" ]; then
+            SHOULD_SKIP=false
+        else
+            continue
+        fi
+    fi
+
+    # Validation: Check if the test exists
     if ! $TEST_PROGS_BIN -l | grep -qw "$test"; then
         echo "Warning: Test '$test' not found. Skipping..."
         continue
