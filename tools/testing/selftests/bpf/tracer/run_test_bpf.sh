@@ -88,3 +88,11 @@ done
 
 echo "--------------------------------------------------"
 echo "Done! All traces are perfectly saved in ./$OUT_DIR/"
+
+mkdir -p "$OUT_DIR/empty"
+
+for f in ./$OUT_DIR/*.json; do
+    if [ "$(jq 'length' "$f")" -eq 0 ]; then
+        mv "$f" "$OUT_DIR/empty"
+    fi
+done

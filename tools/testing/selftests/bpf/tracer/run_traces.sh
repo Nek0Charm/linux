@@ -7,10 +7,12 @@ TRACE_USER="./trace_user"
 
 # --- Blacklist ---
 BLACKLIST_RULES=(
-    "flow_dissector_classification"
-    "flow_dissector_skb"
-    "stream_success"
-    "verifier_iterating_callbacks"
+    "bpf_iter"                          # too many content
+    "l4lb_all"                          # too many content
+    "flow_dissector_classification"     # kernel panic
+    "flow_dissector_skb"                # kernel panic
+    "stream_success"                    # kernel panic
+    "verifier_iterating_callbacks"      # kernel panic
 )
 BLACKLIST=$(IFS='|'; echo "${BLACKLIST_RULES[*]}")
 
@@ -101,7 +103,7 @@ for test in $TESTS; do
     # Using subshell ( ) to ensure we return to current dir automatically
     (
         cd ..
-        ./test_progs -t "$test" -j1
+        ./test_progs -t "$test" -j4
     )
 
     # Ensure all traces are pushed into Ring Buffer
@@ -116,3 +118,11 @@ done
 
 echo "--------------------------------------------------"
 echo "Done! All traces are perfectly saved in ./$OUT_DIR/"
+
+mkdir -p "$OUT_DIR/empty"
+
+for f in ./$OUT_DIR/*.json; do
+    if [ "$(jq 'length' "$f")" -eq 0 ]; then
+        mv "$f" "$OUT_DIR/empty"
+    fi
+done
