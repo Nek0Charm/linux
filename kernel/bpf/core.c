@@ -1805,7 +1805,7 @@ static u64 ___bpf_prog_run(u64 *regs, const struct bpf_insn *insn, u64 run_id)
 	volatile u32 tail_call_cnt = 0;
 
 #define CONT ({ \
-	if (unlikely(!this_cpu_read(bpf_trace_active))) { \
+	if (unlikely(run_id > 0 && !this_cpu_read(bpf_trace_active))) { \
 		this_cpu_write(bpf_trace_active, 1); \
 		bpf_interp_hook_step(run_id, regs); \
 		this_cpu_write(bpf_trace_active, 0); \
@@ -1814,7 +1814,7 @@ static u64 ___bpf_prog_run(u64 *regs, const struct bpf_insn *insn, u64 run_id)
 })
 
 #define CONT_JMP ({ \
-	if (unlikely(!this_cpu_read(bpf_trace_active))) { \
+	if (unlikely(run_id > 0 && !this_cpu_read(bpf_trace_active))) { \
 		this_cpu_write(bpf_trace_active, 1); \
 		bpf_interp_hook_step(run_id, regs); \
 		this_cpu_write(bpf_trace_active, 0); \
