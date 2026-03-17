@@ -54,9 +54,9 @@ int BPF_PROG(on_start, u64 run_id, const struct bpf_prog *prog, u64 ctx_ptr, u64
 				bpf_probe_read_kernel(&map, sizeof(map), &used_maps[i]);
 				if (!map) continue;
 
-				/* 块 1: Map FD (不可直接解引用，size设为0) */
+				/* 块 1: Map FD (不可直接解引用) */
 				evt->blocks[b_idx].base_addr = (u64)map;
-				evt->blocks[b_idx].size = 0;
+				evt->blocks[b_idx].size = 8; // here must > 0
 				evt->blocks[b_idx].is_direct_value = 0;
 				b_idx++;
 
