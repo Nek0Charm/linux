@@ -2104,6 +2104,13 @@ select_insn:
 		struct bpf_prog *prog;
 		u32 index = BPF_R3;
 
+		// add state of tailcall insn
+		if (unlikely(run_id > 0 && !this_cpu_read(bpf_trace_active))) {
+			this_cpu_write(bpf_trace_active, 1);
+			bpf_interp_hook_step(run_id, regs);
+			this_cpu_write(bpf_trace_active, 0);
+		}
+
 		/* 1. 记录尝试发起的尾调用信息 */
 		trace_printk("BPF_TAIL_CALL: Attempting... Map: %p, Index: %u, Current tail_call_cnt: %u\n",
 				map, index, tail_call_cnt);
