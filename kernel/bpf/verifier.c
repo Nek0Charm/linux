@@ -25921,6 +25921,22 @@ int bpf_check(struct bpf_prog **prog, union bpf_attr *attr, bpfptr_t uattr, __u3
 	if (ARRAY_SIZE(bpf_verifier_ops) == 0)
 		return -EINVAL;
 
+	/* =========================================================
+         * FOR COQ VERIFICATION: FAIL FAST
+         * Reject programs containing atomic instructions (0xc3, 0xdb).
+         * Inserted before ANY memory allocation or lock acquisition.
+         * We can safely return directly without using goto.
+         * ========================================================= */
+        for (i = 0; i < (*prog)->len; i++) {
+                u8 code = (*prog)->insnsi[i].code;
+                if (code == 0xc3 || code == 0xdb) {
+                        pr_info_ratelimited("Coq BPF Verifier: Rejected prog %s due to atomic insn at pc=%d\n",
+                                            (*prog)->aux->name, i);
+                        return -EINVAL;
+                }
+        }
+        /* ========================================================= */
+
 	/* 'struct bpf_verifier_env' can be global, but since it's not small,
 	 * allocate/free it every time bpf_check() is called
 	 */
