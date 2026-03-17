@@ -90,9 +90,19 @@ echo "--------------------------------------------------"
 echo "Done! All traces are perfectly saved in ./$OUT_DIR/"
 
 mkdir -p "$OUT_DIR/empty"
+mkdir -p "$OUT_DIR/error"
 
-for f in ./$OUT_DIR/*.json; do
+for f in "$OUT_DIR"/*.json; do
+    [ -d "$f" ] && continue
+
+    if ! jq . "$f" >/dev/null 2>&1; then
+        echo "Corrupted json file: $f"
+        mv "$f" "$OUT_DIR/error/"
+        continue
+    fi
+
     if [ "$(jq 'length' "$f")" -eq 0 ]; then
-        mv "$f" "$OUT_DIR/empty"
+        echo "Empty json file: $f"
+        mv "$f" "$OUT_DIR/empty/"
     fi
 done
