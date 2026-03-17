@@ -25932,9 +25932,9 @@ int bpf_check(struct bpf_prog **prog, union bpf_attr *attr, bpfptr_t uattr, __u3
 	if (is_target_task) {
 		for (i = 0; i < (*prog)->len; i++) {
 			u8 code = (*prog)->insnsi[i].code;
-			if (code == 0xc3 || code == 0xdb) {
-				pr_info_ratelimited("Coq BPF Verifier: Rejected prog %s due to atomic insn at pc=%d\n",
-						(*prog)->aux->name, i);
+			if (code == 0xc3 || code == 0xdb || code == 0xe5) {
+				pr_info_ratelimited("Rejected prog %s due to insn %x at pc=%d\n",
+						(*prog)->aux->name, code, i);
 				return -EINVAL;
 			}
 		}
