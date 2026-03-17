@@ -259,7 +259,7 @@ create_vm_image()
 	touch "${rootfs_img}"
 	chattr +C "${rootfs_img}" >/dev/null 2>&1 || true
 
-	truncate -s 2G "${rootfs_img}"
+	truncate -s 8G "${rootfs_img}"
 	mkfs.ext4 -q "${rootfs_img}"
 
 	mount_image
