@@ -2142,6 +2142,12 @@ select_insn:
 		 * handled like a helper, that is, bpf_tail_call_proto,
 		 * where arg1_type is ARG_PTR_TO_CTX.
 		 */
+		// add state when tailcall insn success
+		if (unlikely(run_id > 0 && !this_cpu_read(bpf_trace_active))) {
+			this_cpu_write(bpf_trace_active, 1);
+			bpf_interp_hook_step(run_id, regs);
+			this_cpu_write(bpf_trace_active, 0);
+		}
 		insn = prog->insnsi;
 		base_insn = insn; // <--- 极其关键：重置新程序的基址！这样后续的 PC 就归零了！
 		goto select_insn; /* 直接把解释器的指令指针（insn）替换掉，重新进入循环 */
