@@ -192,7 +192,6 @@ static int handle_event(void *ctx, void *data, size_t data_sz)
 		fprintf(run->tmp_fp, "],\n"); // 注意这里加了逗号
 		
 		/* 3. 生成平级的 jmp_table 数组 */
-		fprintf(run->tmp_fp, "    \"jmp_table_cnt\": %u,\n", run->jmp_cnt);
 		fprintf(run->tmp_fp, "    \"jmp_table\": [\n");
 		for (int i = 0; i < run->jmp_cnt; i++) {
 			struct tailcall_record *rec = &run->jmp_table[i];
