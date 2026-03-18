@@ -74,6 +74,7 @@ bool bpf_global_ma_set;
 
 static atomic64_t bpf_trace_run_id = ATOMIC64_INIT(0);	// 递增的run_id
 static DEFINE_PER_CPU(int, bpf_trace_active);
+static DEFINE_PER_CPU(int, bpf_tailcall_entered); // 临时解决方案
 static DEFINE_PER_CPU(u64, bpf_trace_current_run_id);	// 当前bpf程序这一次运行的run_id
 DEFINE_PER_CPU(const struct bpf_prog *, bpf_trace_current_prog_ptr);
 EXPORT_SYMBOL_GPL(bpf_trace_current_prog_ptr);
@@ -84,6 +85,7 @@ void bpf_interp_hook_step(u64 run_id, const u64 *regs);
 void bpf_interp_hook_end(u64 run_id, u64 ret);
 void bpf_interp_hook_call(u64 run_id, u64 fp);
 void bpf_interp_hook_tailcall(u64 run_id, const struct bpf_prog *prog, u32 pc, u64 map_ptr, u32 index);
+void bpf_interp_hook_tailcall_map(u64 run_id, const struct bpf_map * map_ptr); // 临时解决方案
 
 /* 定义三个 noinline 的空函数作为 fentry hook 点。
  * asm("") 防止编译器将其作为死代码优化掉。
@@ -103,6 +105,9 @@ noinline void bpf_interp_hook_call(u64 run_id, u64 fp) {
 }
 noinline void bpf_interp_hook_tailcall(u64 run_id, const struct bpf_prog *prog, u32 pc, u64 map_ptr, u32 index) {
 	asm volatile("" : : "r"(run_id), "r"(prog), "r"(pc), "r"(map_ptr), "r"(index) : "memory");
+}
+noinline void bpf_interp_hook_tailcall_map(u64 run_id, const struct bpf_map * map_ptr) {
+	asm volatile("" : : "r"(run_id), "r"(map_ptr) : "memory");
 }
 
 /* No hurry in this branch
@@ -2104,6 +2109,14 @@ select_insn:
 		struct bpf_prog *prog;
 		u32 index = BPF_R3;
 
+		if (unlikely(run_id > 0 && !this_cpu_read(bpf_trace_active) && !this_cpu_read(bpf_tailcall_entered))) {
+			this_cpu_write(bpf_trace_active, 1);
+			this_cpu_write(bpf_tailcall_entered, 1);
+			/* 将触发本次跳转的 map 指针和 index 一并传出 */
+			bpf_interp_hook_tailcall_map(run_id, map);
+			this_cpu_write(bpf_trace_active, 0);
+		}
+
 		/* 1. 记录尝试发起的尾调用信息 */
 		trace_printk("BPF_TAIL_CALL: Attempting... Map: %p, Index: %u, Current tail_call_cnt: %u\n",
 				map, index, tail_call_cnt);
@@ -2410,6 +2423,7 @@ static unsigned int PROG_NAME(stack_size)(const void *ctx, const struct bpf_insn
 		bpf_interp_hook_start(current_run_id, prog_ptr, ARG1, FP); \
 		this_cpu_write(bpf_trace_active, 0); \
 	} \
+	this_cpu_write(bpf_tailcall_entered, 0); \
 \
 	/* D. 执行 BPF 主程序，传入 current_run_id (目标程序 >0，非目标程序 ==0) */ \
 	ret = ___bpf_prog_run(regs, insn, current_run_id); \

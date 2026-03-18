@@ -17,6 +17,7 @@ enum trace_evt_type {
 	EVT_PROG_END   = 3,
 	EVT_PROG_CALL  = 4, // 新增内部调用事件
 	EVT_PROG_TAILCALL = 5,
+	EVT_PROG_TAILCALL_MAP = 6,
 };
 
 /* 基础事件头 */
@@ -63,6 +64,12 @@ struct evt_prog_tailcall {
 	__u64 prog_ptr;      // 目标程序的内存地址
 	__u32 insn_cnt;
 	struct bpf_insn insns[MAX_INSN_DUMP];
+};
+
+struct evt_prog_tailcall_map {
+	struct trace_hdr hdr;
+	__u64 map_ptr;       // 尾调用传入的 Map 指针 (R2)
+	__u32 max_entries;
 };
 
 #endif /* __TRACE_COMMON_H */

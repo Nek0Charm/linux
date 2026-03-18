@@ -37,6 +37,8 @@ struct active_run {
 	/* 新增：缓存所有的尾调用信息 */
 	struct tailcall_record jmp_table[MAX_TAILCALL_RECORD];
 	int jmp_cnt;
+	int jmp_max_entries; // 临时
+	__u64 jmp_map_ptr;   // 临时
 	struct active_run *next;
 };
 
@@ -66,6 +68,7 @@ static struct active_run *get_or_create_run(__u64 run_id) {
 	new_run->is_corrupted = false; // <--- 新增
 	new_run->sp_cnt = 0; // 初始化内部调用计数
 	new_run->jmp_cnt = 0;
+	new_run->jmp_max_entries = 0;
 	snprintf(new_run->tmp_filename, sizeof(new_run->tmp_filename), "/tmp/bpf_run_%llu.tmp", run_id);
 	new_run->tmp_fp = fopen(new_run->tmp_filename, "w+");
 	
@@ -192,13 +195,15 @@ static int handle_event(void *ctx, void *data, size_t data_sz)
 		fprintf(run->tmp_fp, "],\n"); // 注意这里加了逗号
 		
 		/* 3. 生成平级的 jmp_table 数组 */
+		fprintf(run->tmp_fp, "    \"jmp_max_entries\": %d,\n", run->jmp_max_entries);
+		fprintf(run->tmp_fp, "    \"jmp_map_ptr\": \"0x%llX\",\n", run->jmp_map_ptr);
 		fprintf(run->tmp_fp, "    \"jmp_table\": [\n");
 		for (int i = 0; i < run->jmp_cnt; i++) {
 			struct tailcall_record *rec = &run->jmp_table[i];
 			
 			fprintf(run->tmp_fp, "      {\n");
 			fprintf(run->tmp_fp, "        \"pc\": %u,\n", rec->pc);
-			fprintf(run->tmp_fp, "        \"map_ptr\": \"0x%llX\",\n", (unsigned long long)rec->map_ptr);
+			// fprintf(run->tmp_fp, "        \"map_ptr\": \"0x%llX\",\n", (unsigned long long)rec->map_ptr);
 			fprintf(run->tmp_fp, "        \"index\": %u,\n", rec->index);
 			fprintf(run->tmp_fp, "        \"target\": \"0x%llX\",\n", (unsigned long long)rec->prog_ptr);
 			fprintf(run->tmp_fp, "        \"insns\": [\n");
@@ -261,6 +266,15 @@ static int handle_event(void *ctx, void *data, size_t data_sz)
 			__u32 copy_cnt = evt->insn_cnt > MAX_INSN_DUMP ? MAX_INSN_DUMP : evt->insn_cnt;
 			memcpy(rec->insns, evt->insns, copy_cnt * sizeof(struct bpf_insn));
 		}
+	} else if (hdr->type == EVT_PROG_TAILCALL_MAP) {
+		struct evt_prog_tailcall_map *evt = data;
+		run = get_or_create_run(hdr->run_id); 
+		
+		if (!run->has_started) run->is_corrupted = true;
+		if (run->is_corrupted) return 0;
+		
+		run->jmp_map_ptr = evt->map_ptr;
+		run->jmp_max_entries = evt->max_entries;
 	}
 	return 0;
 }

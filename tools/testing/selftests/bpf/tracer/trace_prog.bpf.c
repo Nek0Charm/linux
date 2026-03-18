@@ -54,6 +54,10 @@ int BPF_PROG(on_start, u64 run_id, const struct bpf_prog *prog, u64 ctx_ptr, u64
 				bpf_probe_read_kernel(&map, sizeof(map), &used_maps[i]);
 				if (!map) continue;
 
+				u32 map_type = 0;
+				bpf_probe_read_kernel(&map_type, sizeof(map_type), &map->map_type);
+				if (map_type == BPF_MAP_TYPE_PROG_ARRAY) break;
+
 				/* 块 1: Map FD (不可直接解引用) */
 				evt->blocks[b_idx].base_addr = (u64)map;
 				evt->blocks[b_idx].size = 8; // here must > 0
@@ -61,8 +65,6 @@ int BPF_PROG(on_start, u64 run_id, const struct bpf_prog *prog, u64 ctx_ptr, u64
 				b_idx++;
 
 				/* 块 2: Map Value (仅 Array Map 等支持直接解引用) */
-				u32 map_type = 0;
-				bpf_probe_read_kernel(&map_type, sizeof(map_type), &map->map_type);
 				if (map_type == BPF_MAP_TYPE_ARRAY) {
 					u32 v_size = 0, m_entries = 0;
 					bpf_probe_read_kernel(&v_size, sizeof(v_size), &map->value_size);
@@ -159,6 +161,21 @@ int BPF_PROG(on_tailcall, u64 run_id, const struct bpf_prog *prog, u32 pc, u64 m
 	if (copy_cnt > 0) {
 		bpf_probe_read_kernel(evt->insns, copy_cnt * sizeof(struct bpf_insn), prog->insnsi);
 	}
+
+	bpf_ringbuf_submit(evt, 0);
+	return 0;
+}
+
+SEC("fentry/bpf_interp_hook_tailcall_map")
+int BPF_PROG(on_tailcall_map, u64 run_id, const struct bpf_map * map_ptr)
+{	
+	struct evt_prog_tailcall_map *evt = bpf_ringbuf_reserve(&rb, sizeof(*evt), 0);
+	if (!evt) return 0;
+
+	evt->hdr.run_id = run_id;
+	evt->hdr.type = EVT_PROG_TAILCALL_MAP;
+	evt->map_ptr = (u64)map_ptr;
+	evt->max_entries = map_ptr->max_entries;
 
 	bpf_ringbuf_submit(evt, 0);
 	return 0;
