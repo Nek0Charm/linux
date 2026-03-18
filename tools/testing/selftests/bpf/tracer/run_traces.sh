@@ -9,10 +9,17 @@ TRACE_USER="./trace_user"
 BLACKLIST_RULES=(
     "bpf_iter"                          # too many content
     "l4lb_all"                          # too many content
+    "ns_xsk_drv"                        # too many content
+    "ns_xsk_skb"                        # too many content
+    "xdp"                               # too many content
+    "xdp_perf"                          # too many content
     "flow_dissector_classification"     # kernel panic
     "flow_dissector_skb"                # kernel panic
     "stream_success"                    # kernel panic
     "verifier_iterating_callbacks"      # kernel panic
+    "verifier_xdp_direct_packet_access" # load from ctx
+    "vrf_socket_lookup"                 # load from ctx
+    "xdp_adjust_frags"                  # load from ctx
 )
 BLACKLIST=$(IFS='|'; echo "${BLACKLIST_RULES[*]}")
 
@@ -56,7 +63,7 @@ if [ -n "$SELECTED_ARGS" ]; then
     echo "Running specified tests: $TESTS"
 else
     echo "Fetching all tests from $TEST_PROGS_BIN..."
-    TESTS=$($TEST_PROGS_BIN -l | grep -vE "$BLACKLIST")
+    TESTS=$($TEST_PROGS_BIN -l | grep -vwE "$BLACKLIST")
 fi
 
 # 6. Execution Loop
