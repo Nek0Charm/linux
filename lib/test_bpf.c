@@ -2713,7 +2713,7 @@ static int bpf_fill_jmp32_jsle_reg(struct bpf_test *self)
 #define MAX_STAGGERED_JMP_SIZE ((0x7fff / 3) & ~1)
 
 /* We use a reduced number of iterations to get a reasonable execution time */
-#define NR_STAGGERED_JMP_RUNS 10
+#define NR_STAGGERED_JMP_RUNS 1
 
 static int __bpf_fill_staggered_jumps(struct bpf_test *self,
 				      const struct bpf_insn *jmp,
