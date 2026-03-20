@@ -6,6 +6,42 @@ MODULE_NAME="test_bpf"
 TEST_MODULE="../../../../../lib/test_bpf.ko"
 TRACE_USER="./trace_user"
 
+# --- 你的多行黑名单配置 (完全支持) ---
+BLACKLIST_RULES=(
+    "43"                                # BPF_SUB, R0, R0
+    "324 329 330 335 336 341 342"       # store
+    "367-450 729-748 758-762 892-931"   # atomic
+    "851-891 932-979"                   # pc oob
+    "980-984 988 989 993 994"           # some reason
+    "1000-1052"                         # pc oob
+)
+
+declare -A BLACKLIST_MAP
+echo "Initializing blacklist..."
+
+# 第一层循环：取出数组里的每一行
+for group in "${BLACKLIST_RULES[@]}"; do
+    # 第二层循环：将每一行按空格拆分成单个元素 (重点在这里：不加引号的 $group)
+    for item in $group; do
+        if [[ "$item" =~ ^([0-9]+)-([0-9]+)$ ]]; then
+            # 处理范围格式 (例如 367-450)
+            start=${BASH_REMATCH[1]}
+            end=${BASH_REMATCH[2]}
+            for ((i=start; i<=end; i++)); do
+                BLACKLIST_MAP[$i]=1
+            done
+        elif [[ "$item" =~ ^[0-9]+$ ]]; then
+            # 处理单个数字格式 (例如 43)
+            BLACKLIST_MAP[$item]=1
+        fi
+    done
+done
+
+# 检查函数保持不变
+is_blacklisted() {
+    [[ -n "${BLACKLIST_MAP[$1]}" ]]
+}
+
 # 1. Root Check
 if [ "$EUID" -ne 0 ]; then
     echo "Error: Please run as root (or use sudo) to disable BPF JIT."
@@ -17,7 +53,7 @@ echo "Disabling BPF JIT for consistent tracing..."
 echo 0 | tee /proc/sys/net/core/bpf_jit_enable > /dev/null
 
 # 3. Validation
-if [ ! "$TEST_MODULE" ]; then
+if [ ! -f "$TEST_MODULE" ]; then # 修正：这里用 -f 检查文件更好
     echo "Error: $TEST_MODULE not found."
     exit 1
 fi
@@ -29,21 +65,19 @@ fi
 mkdir -p "$OUT_DIR"
 
 START_ID=0
-END_ID=1052   # 这里可以设置你想跑的总范围，比如 0 到 99
-BATCH_SIZE=10 # 每 10 个测试存为一个 JSON 文件
+END_ID=1052   
+BATCH_SIZE=10 
 
 echo "Starting automated tracing (Batch size: $BATCH_SIZE, IDs: $START_ID to $END_ID)..."
-echo "Starting automated tracing for test_bpf (IDs: $START_ID to $END_ID)..."
 
 if lsmod | grep -q "^${MODULE_NAME} "; then
     echo "[!] Detected residual ${MODULE_NAME} module. Cleaning up..."
     rmmod "$MODULE_NAME"
 fi
 
-# 外层循环：按批次步进 (0, 10, 20...)
+# 外层循环：按批次步进
 for (( batch_start=$START_ID; batch_start<=$END_ID; batch_start+=$BATCH_SIZE )); do
     
-    # 计算当前批次的结束 ID
     batch_end=$(( batch_start + BATCH_SIZE - 1 ))
     if (( batch_end > END_ID )); then
         batch_end=$END_ID
@@ -54,31 +88,27 @@ for (( batch_start=$START_ID; batch_start<=$END_ID; batch_start+=$BATCH_SIZE ));
     echo "=================================================="
     echo "Tracing batch: test_id $batch_start to $batch_end -> $JSON_FILE"
     
-    # 1. 启动这 10 个测试专属的追踪器进程
     ./trace_user "$JSON_FILE" &
     TRACE_PID=$!
     
-    # 给追踪器初始化时间
     sleep 0.5
     
-    # 内层循环：密集跑完这 10 个 test_id
+    # 内层循环
     for (( id=$batch_start; id<=$batch_end; id++ )); do
+        if is_blacklisted "$id"; then
+            echo "  [-] Skipping test_id=$id (Blacklisted)"
+            continue
+        fi
+
         echo "  [+] Running test_id=$id..."
         
-        # 极端防卫清理
         rmmod "$MODULE_NAME" 2>/dev/null || true
-        
-        # 加载执行
         insmod "$TEST_MODULE" test_id=$id
         
-        # 等待事件推入 Ring Buffer
         sleep 0.2
-        
-        # 执行完毕，立刻卸载
         rmmod "$MODULE_NAME" 2>/dev/null || true
     done
     
-    # 2. 这 10 个测试全跑完了，发送信号让追踪器闭合 JSON 数组并退出
     echo "  [*] Stopping tracer for batch ${batch_start}-${batch_end}..."
     kill -SIGINT $TRACE_PID
     wait $TRACE_PID 2>/dev/null
@@ -93,7 +123,7 @@ mkdir -p "$OUT_DIR/empty"
 mkdir -p "$OUT_DIR/error"
 
 for f in "$OUT_DIR"/*.json; do
-    [ -d "$f" ] && continue
+    [ -e "$f" ] || continue # 修正：处理文件不存在的情况
 
     if ! jq . "$f" >/dev/null 2>&1; then
         echo "Corrupted json file: $f"

@@ -20,6 +20,7 @@ BLACKLIST_RULES=(
     "verifier_xdp_direct_packet_access" # load from ctx
     "vrf_socket_lookup"                 # load from ctx
     "xdp_adjust_frags"                  # load from ctx
+    “kprobe_multi_bench_attach”         # too many, too weird
 )
 BLACKLIST=$(IFS='|'; echo "${BLACKLIST_RULES[*]}")
 
@@ -99,7 +100,7 @@ for test in $TESTS; do
     TRACE_PID=$!
     
     # Give tracer 0.5s to load BPF skeleton
-    sleep 0.5
+    # sleep 0.5
     
     if ! kill -0 $TRACE_PID 2>/dev/null; then
         echo "Error: Failed to start $TRACE_USER for $test. Skipping..."
@@ -114,7 +115,7 @@ for test in $TESTS; do
     )
 
     # Ensure all traces are pushed into Ring Buffer
-    sleep 0.2
+    # sleep 0.2
     
     # 3. Stop tracer and cleanup
     kill -SIGINT $TRACE_PID
