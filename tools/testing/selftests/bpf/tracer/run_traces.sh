@@ -28,6 +28,11 @@ BLACKLIST_RULES=(
     "kprobe_multi_bench_attach"         # too many, too weird
     "map_lock"                          # ring buffer overflow
     "signal_pending"                    # ring buffer overflow
+    "core_retro" "perf_buffer"          # record map content
+    "get_stack_raw_tp" "hash_large_key" # helper return not ptr + need to record more maps
+    "lwt_reroute" "sk_assign"           # load from ctx
+    "task_fd_query_rawtp"
+    "time_tai"
 )
 BLACKLIST=$(IFS='|'; echo "${BLACKLIST_RULES[*]}")
 

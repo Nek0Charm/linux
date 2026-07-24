@@ -87,6 +87,8 @@ EXPORT_SYMBOL_GPL(bpf_trace_current_prog_ptr);
 #define BPF_INTERP_TRACE_DROP_CTX_INDIRECTION 3
 #define BPF_INTERP_TRACE_DROP_HELPER_MEMORY_SIDE_EFFECT 4
 #define BPF_INTERP_TRACE_DROP_CTX_INTERNAL_STATE 5
+#define BPF_INTERP_TRACE_DROP_TAIL_INDEX_TRUNCATION 6
+#define BPF_INTERP_TRACE_DROP_MAP_VALUE_ACCESS 7
 
 struct bpf_interp_trace_taint_range {
 	u64 start;
@@ -285,6 +287,14 @@ static size_t bpf_interp_trace_output(const struct bpf_insn *insn,
 		return sizeof(u64);
 	}
 
+#ifdef CONFIG_NET
+	if (func == bpf_skb_load_bytes ||
+	    func == bpf_skb_load_bytes_relative) {
+		*output = regs[BPF_REG_3];
+		return regs[BPF_REG_4] > SIZE_MAX ? SIZE_MAX : regs[BPF_REG_4];
+	}
+#endif
+
 #ifdef CONFIG_CGROUP_BPF
 	if (func == bpf_sysctl_get_name ||
 	    func == bpf_sysctl_get_current_value ||
@@ -425,6 +435,77 @@ static size_t bpf_interp_trace_access_size(const struct bpf_insn *insn)
 	default:
 		return 0;
 	}
+}
+
+static bool bpf_interp_trace_array_value_region(const struct bpf_map *map,
+						u64 *start, u64 *end)
+{
+	const struct bpf_array *array;
+	u64 size;
+
+	if (!map || map->map_type != BPF_MAP_TYPE_ARRAY)
+		return false;
+
+	array = container_of(map, struct bpf_array, map);
+	if (check_mul_overflow((u64)array->elem_size,
+			       (u64)map->max_entries, &size))
+		return false;
+
+	*start = (u64)(unsigned long)array->value;
+	return bpf_interp_trace_range(*start, size, end);
+}
+
+/*
+ * Array-map value bytes are represented in the JSON address map, but their
+ * contents are not serialized.  Drop only when the program actually accesses
+ * those bytes; merely carrying or passing the map pointer remains traceable.
+ */
+static bool bpf_interp_trace_map_value_access(const struct bpf_insn *insn,
+					      const u64 *regs)
+{
+	const struct bpf_prog *prog;
+	const struct bpf_prog_aux *aux;
+	size_t size = bpf_interp_trace_access_size(insn);
+	u8 class = BPF_CLASS(insn->code);
+	u8 mode = BPF_MODE(insn->code);
+	u64 addr, access_end;
+	u32 i;
+
+	if (!size)
+		return false;
+
+	if (class == BPF_LDX &&
+	    (mode == BPF_MEM || mode == BPF_MEMSX ||
+	     mode == BPF_PROBE_MEM || mode == BPF_PROBE_MEMSX)) {
+		addr = regs[insn->src_reg] + insn->off;
+	} else if ((class == BPF_ST || class == BPF_STX) && mode == BPF_MEM) {
+		addr = regs[insn->dst_reg] + insn->off;
+	} else if (class == BPF_STX && mode == BPF_ATOMIC) {
+		addr = regs[insn->imm == BPF_LOAD_ACQ ?
+			    insn->src_reg : insn->dst_reg] + insn->off;
+	} else {
+		return false;
+	}
+
+	if (!bpf_interp_trace_range(addr, size, &access_end))
+		return false;
+
+	prog = this_cpu_read(bpf_trace_current_prog_ptr);
+	if (!prog || !prog->aux)
+		return false;
+	aux = prog->aux;
+
+	for (i = 0; i < aux->used_map_cnt; i++) {
+		u64 map_start, map_end;
+
+		if (!bpf_interp_trace_array_value_region(aux->used_maps[i],
+							 &map_start, &map_end))
+			continue;
+		if (addr < map_end && map_start < access_end)
+			return true;
+	}
+
+	return false;
 }
 
 /*
@@ -2261,6 +2342,11 @@ select_insn:
 					  BPF_INTERP_TRACE_DROP_CTX_INTERNAL_STATE);
 		run_id = 0;
 	} else if (unlikely(run_id > 0 &&
+			    bpf_interp_trace_map_value_access(insn, regs))) {
+		bpf_interp_trace_drop_run(run_id,
+					  BPF_INTERP_TRACE_DROP_MAP_VALUE_ACCESS);
+		run_id = 0;
+	} else if (unlikely(run_id > 0 &&
 			    bpf_interp_trace_taint_access(insn, regs))) {
 		bpf_interp_trace_drop_helper_memory(run_id);
 		run_id = 0;
@@ -2576,6 +2662,19 @@ select_insn:
 			trace_printk("BPF_TAIL_CALL: FAIL - Index out of bounds (%u >= %u)\n", 
 					index, array->map.max_entries);
 			goto out;
+		}
+
+		/*
+		 * The interpreter truncates R3 to u32, while the validator's
+		 * current tail-call model checks all 64 bits.  Drop only when the
+		 * truncation selects a populated slot and therefore changes control
+		 * flow immediately.
+		 */
+		if (unlikely(run_id > 0 && BPF_R3 != (u64)index &&
+			     READ_ONCE(array->ptrs[index]))) {
+			bpf_interp_trace_drop_run(run_id,
+				BPF_INTERP_TRACE_DROP_TAIL_INDEX_TRUNCATION);
+			run_id = 0;
 		}
 
 		if (unlikely(tail_call_cnt >= MAX_TAIL_CALL_CNT)) {
