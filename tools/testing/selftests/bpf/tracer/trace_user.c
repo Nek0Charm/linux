@@ -55,6 +55,12 @@ static const char *drop_reason_name(__u32 reason)
 		return "unsupported tail-call target";
 	case TRACE_DROP_TAIL_COUNT_DIVERGENCE:
 		return "tail-call counter divergence";
+	case TRACE_DROP_CTX_INDIRECTION:
+		return "unmodeled context-pointer indirection";
+	case TRACE_DROP_HELPER_MEMORY_SIDE_EFFECT:
+		return "unmodeled helper memory side effect";
+	case TRACE_DROP_CTX_INTERNAL_STATE:
+		return "unmodeled kernel context state";
 	default:
 		return "unknown";
 	}

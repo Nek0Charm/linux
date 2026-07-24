@@ -81,8 +81,26 @@ DEFINE_PER_CPU(const struct bpf_prog *, bpf_trace_current_prog_ptr);
 EXPORT_SYMBOL_GPL(bpf_trace_current_prog_ptr);
 
 #define BPF_INTERP_TRACE_MAX_INSNS 2048
+#define BPF_INTERP_TRACE_MAX_TAINT_RANGES 8
 #define BPF_INTERP_TRACE_DROP_UNSUPPORTED_TAIL_TARGET 1
 #define BPF_INTERP_TRACE_DROP_TAIL_COUNT_DIVERGENCE 2
+#define BPF_INTERP_TRACE_DROP_CTX_INDIRECTION 3
+#define BPF_INTERP_TRACE_DROP_HELPER_MEMORY_SIDE_EFFECT 4
+#define BPF_INTERP_TRACE_DROP_CTX_INTERNAL_STATE 5
+
+struct bpf_interp_trace_taint_range {
+	u64 start;
+	u64 end;
+};
+
+struct bpf_interp_trace_taint_state {
+	u32 count;
+	struct bpf_interp_trace_taint_range
+		ranges[BPF_INTERP_TRACE_MAX_TAINT_RANGES];
+};
+
+static DEFINE_PER_CPU(struct bpf_interp_trace_taint_state,
+			      bpf_trace_taint_state);
 
 static bool bpf_interp_trace_global_map(const struct bpf_map *map)
 {
@@ -124,12 +142,19 @@ static bool bpf_interp_prog_traceable(const struct bpf_prog *prog)
 		if (bpf_interp_trace_global_map(map))
 			return false;
 
-		/* Nested maps and ring-buffer storage are not modeled yet. */
+		/*
+		 * Nested maps and ring-buffer storage are not modeled yet.
+		 * Cgroup-storage values are selected from the current BPF run
+		 * context (and can be per-CPU), so their addresses cannot be
+		 * serialized from aux->used_maps at program start.
+		 */
 		switch (map->map_type) {
 		case BPF_MAP_TYPE_ARRAY_OF_MAPS:
 		case BPF_MAP_TYPE_HASH_OF_MAPS:
 		case BPF_MAP_TYPE_RINGBUF:
 		case BPF_MAP_TYPE_USER_RINGBUF:
+		case BPF_MAP_TYPE_CGROUP_STORAGE:
+		case BPF_MAP_TYPE_PERCPU_CGROUP_STORAGE:
 			return false;
 		default:
 			break;
@@ -137,6 +162,315 @@ static bool bpf_interp_prog_traceable(const struct bpf_prog *prog)
 	}
 
 	return true;
+}
+
+static bool bpf_interp_trace_ctx_indirect(const struct bpf_prog *prog,
+					  const struct bpf_insn *base_insn,
+					  const struct bpf_insn *insn)
+{
+	const struct bpf_insn *next;
+	u32 pc;
+
+	if (!prog || insn->code != (BPF_LDX | BPF_MEM | BPF_DW))
+		return false;
+
+	pc = insn - base_insn;
+	if (pc + 1 >= prog->len)
+		return false;
+	next = insn + 1;
+
+	switch (prog->type) {
+	case BPF_PROG_TYPE_CGROUP_SOCKOPT:
+		/*
+		 * cg_sockopt_convert_ctx_access() expands ctx->retval through
+		 * bpf_sockopt_kern.current_task and task_struct.bpf_ctx.  The
+		 * validator only has the outer context allocation.
+		 */
+		return insn->off ==
+			       offsetof(struct bpf_sockopt_kern, current_task) &&
+		       next->code == (BPF_LDX | BPF_MEM | BPF_DW) &&
+		       next->dst_reg == insn->dst_reg &&
+		       next->src_reg == insn->dst_reg &&
+		       next->off == offsetof(struct task_struct, bpf_ctx);
+	case BPF_PROG_TYPE_CGROUP_SYSCTL:
+		/*
+		 * sysctl_convert_ctx_access() expands ctx->file_pos through the
+		 * ppos pointer.  Match the following indirect load/store as well
+		 * so an unrelated load at the same offset is not dropped.
+		 */
+		if (insn->off != offsetof(struct bpf_sysctl_kern, ppos) ||
+		    BPF_MODE(next->code) != BPF_MEM)
+			return false;
+
+		if (BPF_CLASS(next->code) == BPF_LDX)
+			return next->dst_reg == insn->dst_reg &&
+			       next->src_reg == insn->dst_reg;
+
+		return (BPF_CLASS(next->code) == BPF_ST ||
+			BPF_CLASS(next->code) == BPF_STX) &&
+		       next->dst_reg == insn->dst_reg;
+	default:
+		return false;
+	}
+}
+
+static bool
+bpf_interp_trace_current_ctx_indirect(const struct bpf_insn *base_insn,
+				      const struct bpf_insn *insn)
+{
+	const struct bpf_prog *prog;
+
+	prog = this_cpu_read(bpf_trace_current_prog_ptr);
+	return bpf_interp_trace_ctx_indirect(prog, base_insn, insn);
+}
+
+static bool
+bpf_interp_trace_ctx_internal_state(const struct bpf_prog *prog,
+				    const struct bpf_insn *base_insn,
+				    const struct bpf_insn *insn)
+{
+	const struct bpf_insn *next;
+	u32 pc;
+
+	if (!prog || prog->type != BPF_PROG_TYPE_CGROUP_SKB ||
+	    insn->code != (BPF_LDX | BPF_MEM | BPF_B) ||
+	    insn->dst_reg != BPF_REG_AX ||
+	    insn->off != SKB_BF_MONO_TC_OFFSET)
+		return false;
+
+	pc = insn - base_insn;
+	if (pc + 1 >= prog->len)
+		return false;
+	next = insn + 1;
+
+	/*
+	 * bpf_convert_tstamp_{read,write}() consults skb->tc_at_ingress
+	 * and skb->tstamp_type before accessing skb->tstamp.  The validator
+	 * allocates the outer context block but does not initialize these
+	 * kernel-private bitfields, so the following JSET would branch on
+	 * Vundef.  Match the complete generated prefix to avoid dropping an
+	 * unrelated byte load at the same struct offset.
+	 */
+	return next->code == (BPF_JMP32 | BPF_JSET | BPF_K) &&
+	       next->dst_reg == BPF_REG_AX &&
+	       next->imm == TC_AT_INGRESS_MASK && next->off == 1;
+}
+
+static bool
+bpf_interp_trace_current_ctx_internal_state(const struct bpf_insn *base_insn,
+					    const struct bpf_insn *insn)
+{
+	const struct bpf_prog *prog;
+
+	prog = this_cpu_read(bpf_trace_current_prog_ptr);
+	return bpf_interp_trace_ctx_internal_state(prog, base_insn, insn);
+}
+
+/*
+ * The verifier replaces a helper ID with its function offset.  Return the
+ * helper's possible output region for helpers whose memory effects are not
+ * modeled by the validator; a zero size means that no taint is needed.
+ */
+static size_t bpf_interp_trace_output(const struct bpf_insn *insn,
+				      const u64 *regs, u64 *output)
+{
+	typeof(__bpf_call_base) *func;
+
+	if (insn->code != (BPF_JMP | BPF_CALL) || insn->src_reg)
+		return 0;
+
+	func = __bpf_call_base + insn->imm;
+	if (func == bpf_strtol_proto.func || func == bpf_strtoul_proto.func) {
+		*output = regs[BPF_REG_4];
+		return sizeof(u64);
+	}
+
+#ifdef CONFIG_CGROUP_BPF
+	if (func == bpf_sysctl_get_name ||
+	    func == bpf_sysctl_get_current_value ||
+	    func == bpf_sysctl_get_new_value) {
+		*output = regs[BPF_REG_2];
+		return regs[BPF_REG_3] > SIZE_MAX ? SIZE_MAX : regs[BPF_REG_3];
+	}
+#endif
+
+	return 0;
+}
+
+static bool bpf_interp_trace_range(u64 addr, size_t size, u64 *end)
+{
+	return size && !check_add_overflow(addr, (u64)size, end);
+}
+
+static bool bpf_interp_trace_taint_overlaps(u64 addr, size_t size)
+{
+	struct bpf_interp_trace_taint_state *state;
+	u64 end;
+	u32 i;
+
+	if (!bpf_interp_trace_range(addr, size, &end))
+		return false;
+
+	state = this_cpu_ptr(&bpf_trace_taint_state);
+	for (i = 0; i < state->count; i++) {
+		const struct bpf_interp_trace_taint_range *range;
+
+		range = &state->ranges[i];
+		if (addr < range->end && range->start < end)
+			return true;
+	}
+
+	return false;
+}
+
+static bool bpf_interp_trace_taint_add(u64 addr, size_t size)
+{
+	struct bpf_interp_trace_taint_state *state;
+	u64 end;
+	u32 i;
+
+	if (!size)
+		return true;
+	if (!bpf_interp_trace_range(addr, size, &end))
+		return false;
+
+	state = this_cpu_ptr(&bpf_trace_taint_state);
+	for (i = 0; i < state->count; i++) {
+		struct bpf_interp_trace_taint_range *range;
+
+		range = &state->ranges[i];
+		if (addr <= range->end && range->start <= end) {
+			range->start = min(range->start, addr);
+			range->end = max(range->end, end);
+			return true;
+		}
+	}
+
+	if (state->count == BPF_INTERP_TRACE_MAX_TAINT_RANGES)
+		return false;
+
+	state->ranges[state->count].start = addr;
+	state->ranges[state->count].end = end;
+	state->count++;
+	return true;
+}
+
+static void bpf_interp_trace_taint_remove(u32 index)
+{
+	struct bpf_interp_trace_taint_state *state;
+
+	state = this_cpu_ptr(&bpf_trace_taint_state);
+	state->count--;
+	state->ranges[index] = state->ranges[state->count];
+}
+
+static void bpf_interp_trace_taint_clear(u64 addr, size_t size)
+{
+	struct bpf_interp_trace_taint_state *state;
+	u64 end;
+	u32 i = 0;
+
+	if (!bpf_interp_trace_range(addr, size, &end))
+		return;
+
+	state = this_cpu_ptr(&bpf_trace_taint_state);
+	while (i < state->count) {
+		struct bpf_interp_trace_taint_range *range;
+
+		range = &state->ranges[i];
+		if (end <= range->start || range->end <= addr) {
+			i++;
+			continue;
+		}
+
+		if (addr <= range->start && range->end <= end) {
+			bpf_interp_trace_taint_remove(i);
+			continue;
+		}
+
+		if (addr <= range->start) {
+			range->start = end;
+			i++;
+			continue;
+		}
+
+		if (range->end <= end) {
+			range->end = addr;
+			i++;
+			continue;
+		}
+
+		/* A middle overwrite splits one tainted range into two. */
+		if (state->count < BPF_INTERP_TRACE_MAX_TAINT_RANGES) {
+			state->ranges[state->count].start = end;
+			state->ranges[state->count].end = range->end;
+			state->count++;
+			range->end = addr;
+		}
+		i++;
+	}
+}
+
+static size_t bpf_interp_trace_access_size(const struct bpf_insn *insn)
+{
+	switch (BPF_SIZE(insn->code)) {
+	case BPF_B:
+		return sizeof(u8);
+	case BPF_H:
+		return sizeof(u16);
+	case BPF_W:
+		return sizeof(u32);
+	case BPF_DW:
+		return sizeof(u64);
+	default:
+		return 0;
+	}
+}
+
+/*
+ * Return true only when an instruction observes helper-tainted memory.  Plain
+ * BPF stores are modeled by the validator, so they clear the bytes they fully
+ * define and can make a later load traceable again.
+ */
+static bool bpf_interp_trace_taint_access(const struct bpf_insn *insn,
+					  const u64 *regs)
+{
+	size_t size = bpf_interp_trace_access_size(insn);
+	u8 class = BPF_CLASS(insn->code);
+	u8 mode = BPF_MODE(insn->code);
+	u64 addr;
+
+	if (!size)
+		return false;
+
+	if (class == BPF_LDX &&
+	    (mode == BPF_MEM || mode == BPF_MEMSX ||
+	     mode == BPF_PROBE_MEM || mode == BPF_PROBE_MEMSX)) {
+		addr = regs[insn->src_reg] + insn->off;
+		return bpf_interp_trace_taint_overlaps(addr, size);
+	}
+
+	if ((class == BPF_ST || class == BPF_STX) && mode == BPF_MEM) {
+		addr = regs[insn->dst_reg] + insn->off;
+		bpf_interp_trace_taint_clear(addr, size);
+		return false;
+	}
+
+	if (class != BPF_STX || mode != BPF_ATOMIC)
+		return false;
+
+	if (insn->imm == BPF_LOAD_ACQ) {
+		addr = regs[insn->src_reg] + insn->off;
+		return bpf_interp_trace_taint_overlaps(addr, size);
+	}
+
+	addr = regs[insn->dst_reg] + insn->off;
+	if (insn->imm == BPF_STORE_REL) {
+		bpf_interp_trace_taint_clear(addr, size);
+		return false;
+	}
+
+	return bpf_interp_trace_taint_overlaps(addr, size);
 }
 
 /* 先声明原型，满足编译器的强制规则 */
@@ -188,6 +522,12 @@ static void bpf_interp_trace_drop_run(u64 run_id, u32 reason)
 
 	this_cpu_write(bpf_trace_current_drop, true);
 	this_cpu_write(bpf_trace_current_run_id, 0);
+}
+
+static void bpf_interp_trace_drop_helper_memory(u64 run_id)
+{
+	bpf_interp_trace_drop_run(run_id,
+				  BPF_INTERP_TRACE_DROP_HELPER_MEMORY_SIDE_EFFECT);
 }
 
 /* No hurry in this branch
@@ -1909,6 +2249,22 @@ static u64 ___bpf_prog_run(u64 *regs, const struct bpf_insn *insn, u64 run_id)
 })
 
 select_insn:
+	if (unlikely(run_id > 0 &&
+		     bpf_interp_trace_current_ctx_indirect(base_insn, insn))) {
+		bpf_interp_trace_drop_run(run_id,
+					  BPF_INTERP_TRACE_DROP_CTX_INDIRECTION);
+		run_id = 0;
+	} else if (unlikely(run_id > 0 &&
+			    bpf_interp_trace_current_ctx_internal_state(base_insn,
+								insn))) {
+		bpf_interp_trace_drop_run(run_id,
+					  BPF_INTERP_TRACE_DROP_CTX_INTERNAL_STATE);
+		run_id = 0;
+	} else if (unlikely(run_id > 0 &&
+			    bpf_interp_trace_taint_access(insn, regs))) {
+		bpf_interp_trace_drop_helper_memory(run_id);
+		run_id = 0;
+	}
 	goto *jumptable[insn->code];
 
 	/* Explicitly mask the register-based shift amounts with 63 or 31
@@ -2168,14 +2524,28 @@ select_insn:
 		CONT;
 
 	/* CALL */
-	JMP_CALL:
+	JMP_CALL: {
+		u64 helper_output = 0;
+		size_t output_size = 0;
+
 		/* Function call scratches BPF_R1-BPF_R5 registers,
 		 * preserves BPF_R6-BPF_R9, and stores return value
 		 * into BPF_R0.
 		 */
+		if (unlikely(run_id > 0))
+			output_size = bpf_interp_trace_output(insn, regs, &helper_output);
+
 		BPF_R0 = (__bpf_call_base + insn->imm)(BPF_R1, BPF_R2, BPF_R3,
 						       BPF_R4, BPF_R5);
+
+		if (unlikely(output_size &&
+			     !bpf_interp_trace_taint_add(helper_output,
+							output_size))) {
+			bpf_interp_trace_drop_helper_memory(run_id);
+			run_id = 0;
+		}
 		CONT;
+	}
 
 	JMP_CALL_ARGS:
 		BPF_R0 = (__bpf_call_base_args + insn->imm)(BPF_R1, BPF_R2,
@@ -2501,6 +2871,7 @@ static unsigned int PROG_NAME(stack_size)(const void *ctx, const struct bpf_insn
 	u64 regs[MAX_BPF_EXT_REG] = {}; \
 	u64 old_run_id, current_run_id = 0; \
 	const struct bpf_prog *prog_ptr; \
+	struct bpf_interp_trace_taint_state old_taint; \
 	bool old_drop, is_target = false; \
 	u64 ret; \
 \
@@ -2529,6 +2900,9 @@ static unsigned int PROG_NAME(stack_size)(const void *ctx, const struct bpf_insn
 \
 	/* C. 触发 START Hook (仅目标程序) */ \
 	if (unlikely(is_target)) { \
+		old_taint = *this_cpu_ptr(&bpf_trace_taint_state); \
+		memset(this_cpu_ptr(&bpf_trace_taint_state), 0, \
+		       sizeof(struct bpf_interp_trace_taint_state)); \
 		this_cpu_write(bpf_trace_active, 1); \
 		/* 传入 ctx (作为 R1) 和 FP (作为 R10) */ \
 		bpf_interp_hook_start(current_run_id, prog_ptr, ARG1, FP); \
@@ -2545,6 +2919,9 @@ static unsigned int PROG_NAME(stack_size)(const void *ctx, const struct bpf_insn
 		bpf_interp_hook_end(current_run_id, ret); \
 		this_cpu_write(bpf_trace_active, 0); \
 	} \
+\
+	if (unlikely(is_target)) \
+		*this_cpu_ptr(&bpf_trace_taint_state) = old_taint; \
 \
 	/* F. 恢复旧的 run_id */ \
 	this_cpu_write(bpf_trace_current_run_id, old_run_id); \
