@@ -62,6 +62,9 @@ MOUNT_DIR="mnt"
 LOCAL_ROOTFS_IMAGE=""
 ROOTFS_IMAGE="root.img"
 OUTPUT_DIR="$HOME/.bpf_selftests"
+RESULTS_DIR=""
+BPF_VM_USE_KVM="${BPF_VM_USE_KVM:-1}"
+BPF_VM_TIMEOUT="${BPF_VM_TIMEOUT:-7200}"
 KCONFIG_REL_PATHS=("tools/testing/selftests/bpf/config"
 	"tools/testing/selftests/bpf/config.vm"
 	"tools/testing/selftests/bpf/config.${PLATFORM}")
@@ -74,7 +77,7 @@ EXIT_STATUS_FILE="${LOG_FILE_BASE}.exit_status"
 usage()
 {
 	cat <<EOF
-Usage: $0 [-i] [-s] [-d <output_dir>] -- [<command>]
+Usage: $0 [-i] [-s] [-d <output_dir>] [-r <results_dir>] -- [<command>]
 
 <command> is the command you would normally run when you are in
 tools/testing/selftests/bpf. e.g:
@@ -102,6 +105,7 @@ Options:
 	-l)             Specify the path to the local rootfs image.
 	-i)		Update the rootfs image with a newer version.
 	-d)		Update the output directory (default: ${OUTPUT_DIR})
+	-r)		Share this host directory as /output in the VM
 	-j)		Number of jobs for compilation, similar to -j in make
 			(default: ${NUM_COMPILE_JOBS})
 	-s)		Instead of powering off the VM, start an interactive
@@ -195,15 +199,27 @@ unmount_image()
 update_selftests()
 {
 	local kernel_checkout="$1"
+	local make_command="$2"
+	local kernel_build_dir="$3"
 	local selftests_dir="${kernel_checkout}/tools/testing/selftests/bpf"
+	local test_bpf_module="${kernel_build_dir}/lib/test_bpf.ko"
+	local mount_dir="${OUTPUT_DIR}/${MOUNT_DIR}"
+	local build_targets="${BPF_VMTEST_BUILD_TARGETS:-}"
 
 	cd "${selftests_dir}"
-	${make_command}
+	${make_command} ${build_targets}
+	make -C tracer VMLINUX_BTF="${kernel_build_dir}/vmlinux"
+
+	if [[ ! -f "${test_bpf_module}" ]]; then
+		echo "Could not find ${test_bpf_module}" >&2
+		exit 1
+	fi
 
 	# Mount the image and copy the selftests to the image.
 	mount_image
 	sudo rm -rf "${mount_dir}/root/bpf"
 	sudo cp -r "${selftests_dir}" "${mount_dir}/root"
+	sudo install -m 0644 "${test_bpf_module}" "${mount_dir}/root/bpf/test_bpf.ko"
 	unmount_image
 }
 
@@ -234,12 +250,23 @@ EOF
 # incase the VM is forcefully stopped.
 echo "130" > "/root/${EXIT_STATUS_FILE}"
 
+mkdir -p /output
+if ! mount -t 9p -o trans=virtio,version=9p2000.L results /output; then
+	echo "Failed to mount the host result directory at /output"
+	echo "125" > "/root/${EXIT_STATUS_FILE}"
+	poweroff -f
+	exit 125
+fi
+echo "130" > /output/exit-status
+
 {
 	cd /root/bpf
 	echo ${command}
 	stdbuf -oL -eL ${command}
-	echo "\$?" > "/root/${EXIT_STATUS_FILE}"
-} 2>&1 | tee "/root/${LOG_FILE}"
+	status="\$?"
+	echo "\${status}" > "/root/${EXIT_STATUS_FILE}"
+	echo "\${status}" > /output/exit-status
+} 2>&1 | tee "/root/${LOG_FILE}" /output/guest-console.log
 # Ensure that the logs are written to disk
 sync
 EOF
@@ -271,6 +298,7 @@ run_vm()
 {
 	local kernel_bzimage="$1"
 	local rootfs_img="${OUTPUT_DIR}/${ROOTFS_IMAGE}"
+	local -a result_flags=()
 
 	if ! which "${QEMU_BINARY}" &> /dev/null; then
 		cat <<EOF
@@ -280,21 +308,30 @@ EOF
 		exit 1
 	fi
 
-	if [[ "${PLATFORM}" != "$(uname -m)" ]]; then
+	if [[ "${PLATFORM}" != "$(uname -m)" || "${BPF_VM_USE_KVM}" == "0" ]]; then
 		QEMU_FLAGS=("${CROSS_FLAGS[@]}")
 	else
 		QEMU_FLAGS=("${HOST_FLAGS[@]}")
 	fi
 
-	${QEMU_BINARY} \
+	if [[ -n "${RESULTS_DIR}" ]]; then
+		result_flags=(
+			-virtfs
+			"local,path=${RESULTS_DIR},mount_tag=results,security_model=mapped-xattr,multidevs=remap"
+		)
+	fi
+
+	timeout --foreground "${BPF_VM_TIMEOUT}" ${QEMU_BINARY} \
 		-nodefaults \
 		-display none \
 		-serial mon:stdio \
 		"${QEMU_FLAGS[@]}" \
 		-m 4G \
 		-drive file="${rootfs_img}",format=raw,index=1,media=disk,if=virtio,cache=none \
+		"${result_flags[@]}" \
+		-no-reboot \
 		-kernel "${kernel_bzimage}" \
-		-append "root=/dev/vda rw console=${QEMU_CONSOLE}"
+		-append "root=/dev/vda rw console=${QEMU_CONSOLE} panic=1"
 }
 
 copy_logs()
@@ -382,7 +419,7 @@ main()
 	local exit_command="poweroff -f"
 	local debug_shell="no"
 
-	while getopts ':hskl:id:j:' opt; do
+	while getopts ':hskl:id:j:r:' opt; do
 		case ${opt} in
 		l)
 			LOCAL_ROOTFS_IMAGE="$OPTARG"
@@ -392,6 +429,9 @@ main()
 			;;
 		d)
 			OUTPUT_DIR="$OPTARG"
+			;;
+		r)
+			RESULTS_DIR="$OPTARG"
 			;;
 		j)
 			NUM_COMPILE_JOBS="$OPTARG"
@@ -429,7 +469,7 @@ main()
 	if [[ $# -eq 0  && "${debug_shell}" == "no" ]]; then
 		echo "No command specified, will run ${DEFAULT_COMMAND} in the vm"
 	else
-		command="$@"
+		printf -v command '%q ' "$@"
 	fi
 
 	local kconfig_file="${OUTPUT_DIR}/latest.config"
@@ -454,11 +494,17 @@ main()
 
 	local rootfs_img="${OUTPUT_DIR}/${ROOTFS_IMAGE}"
 	local mount_dir="${OUTPUT_DIR}/${MOUNT_DIR}"
+	local kernel_build_dir="${kernel_checkout}"
 
 	echo "Output directory: ${OUTPUT_DIR}"
 
 	mkdir -p "${OUTPUT_DIR}"
 	mkdir -p "${mount_dir}"
+	if [[ -z "${RESULTS_DIR}" ]]; then
+		RESULTS_DIR="${OUTPUT_DIR}/results"
+	fi
+	mkdir -p "${RESULTS_DIR}"
+	RESULTS_DIR="$(realpath "${RESULTS_DIR}")"
 	update_kconfig "${kernel_checkout}" "${kconfig_file}"
 
 	recompile_kernel "${kernel_checkout}" "${make_command}"
@@ -472,7 +518,13 @@ main()
 		create_vm_image
 	fi
 
-	update_selftests "${kernel_checkout}" "${make_command}"
+	if [[ -n "${O}" ]]; then
+		kernel_build_dir="${O}"
+	elif [[ -n "${KBUILD_OUTPUT}" ]]; then
+		kernel_build_dir="${KBUILD_OUTPUT}"
+	fi
+
+	update_selftests "${kernel_checkout}" "${make_command}" "${kernel_build_dir}"
 	update_init_script "${command}" "${exit_command}"
 	run_vm "${kernel_bzimage}"
 	if [[ "${command}" != "" ]]; then

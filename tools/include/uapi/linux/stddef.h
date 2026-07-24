@@ -51,4 +51,21 @@
 		struct { } __empty_ ## NAME; \
 		TYPE NAME[]; \
 	}
+
+#ifndef __counted_by
+#define __counted_by(m)
+#endif
+
+#ifndef __counted_by_le
+#define __counted_by_le(m)
+#endif
+
+#ifndef __counted_by_be
+#define __counted_by_be(m)
+#endif
+
+#ifndef __counted_by_ptr
+#define __counted_by_ptr(m)
+#endif
+
 #endif

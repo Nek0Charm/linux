@@ -1,3 +1,4 @@
+#include <errno.h>
 #include <signal.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -135,8 +136,12 @@ static int handle_event(void *ctx, void *data, size_t data_sz)
 		fprintf(run->tmp_fp, "    \"prog_insn\": [\n");
 		__u32 print_cnt = (evt->insn_cnt > MAX_INSN_DUMP) ? MAX_INSN_DUMP : evt->insn_cnt;
 		for (__u32 i = 0; i < print_cnt; i++) {
+			__u64 raw_insn;
+
+			memcpy(&raw_insn, &evt->insns[i], sizeof(raw_insn));
 			fprintf(run->tmp_fp, "      \"0x%llX\"%s\n",
-				evt->insns[i], (i == print_cnt - 1) ? "" : ",");
+				(unsigned long long)raw_insn,
+				(i == print_cnt - 1) ? "" : ",");
 		}
 		fprintf(run->tmp_fp, "    ],\n");
 		fprintf(run->tmp_fp, "    \"trace\": [\n");
@@ -168,7 +173,6 @@ static int handle_event(void *ctx, void *data, size_t data_sz)
 		fprintf(run->tmp_fp, "]");
 
 	} else if (hdr->type == EVT_PROG_END) {
-		struct evt_prog_end *evt = data;
 		run = get_or_create_run(hdr->run_id);
 
 		/* 如果整个生命周期没有 START，或者已经被标记损坏 */
@@ -210,7 +214,9 @@ static int handle_event(void *ctx, void *data, size_t data_sz)
 			        
 			__u32 print_cnt = rec->insn_cnt > MAX_INSN_DUMP ? MAX_INSN_DUMP : rec->insn_cnt;
 			for (__u32 j = 0; j < print_cnt; j++) {
-				__u64 raw_insn = *((__u64 *)&rec->insns[j]);
+				__u64 raw_insn;
+
+				memcpy(&raw_insn, &rec->insns[j], sizeof(raw_insn));
 				fprintf(run->tmp_fp, "          \"0x%llX\"%s\n", 
 				        (unsigned long long)raw_insn, 
 				        (j == print_cnt - 1) ? "" : ",");
@@ -283,27 +289,43 @@ int main(int argc, char **argv)
 {
 	struct trace_prog_bpf *skel;
 	struct ring_buffer *rb = NULL;
-	int err;
+	const char *ready_file;
+	char *tmp_out_file;
+	FILE *ready_fp;
+	int err = 0;
 
 	/* 1. 支持通过命令行参数指定输出文件 */
 	const char *out_file = MAIN_JSON_FILE;
 	if (argc > 1) {
 		out_file = argv[1];
 	}
+	tmp_out_file = malloc(strlen(out_file) + sizeof(".tmp"));
+	if (!tmp_out_file) {
+		fprintf(stderr, "Failed to allocate temporary output path\n");
+		return 1;
+	}
+	sprintf(tmp_out_file, "%s.tmp", out_file);
 
 	/* 2. 捕获 Ctrl+C (SIGINT) 和 kill (SIGTERM) 信号 */
 	signal(SIGINT, sig_handler);
 	signal(SIGTERM, sig_handler);
 
 	/* 1. 初始化总 JSON 文件 */
-	main_json_fp = fopen(out_file, "w");
+	main_json_fp = fopen(tmp_out_file, "w");
+	if (!main_json_fp) {
+		fprintf(stderr, "Failed to open %s: %s\n",
+			tmp_out_file, strerror(errno));
+		free(tmp_out_file);
+		return 1;
+	}
 	fprintf(main_json_fp, "[\n"); // 数组开头
 
 	/* 2. 打开并加载 eBPF 骨架 */
 	skel = trace_prog_bpf__open_and_load();
 	if (!skel) {
 		fprintf(stderr, "Failed to load eBPF skeleton\n");
-		return 1;
+		err = -EINVAL;
+		goto cleanup;
 	}
 
 	/* 3. 挂载 (Attach) 到内核的 fentry/fexit 点 */
@@ -317,16 +339,36 @@ int main(int argc, char **argv)
 	rb = ring_buffer__new(bpf_map__fd(skel->maps.rb), handle_event, NULL, NULL);
 	if (!rb) {
 		fprintf(stderr, "Failed to create ring buffer\n");
+		err = -ENOMEM;
 		goto cleanup;
 	}
 
-	printf("Tracing BPF programs... Outputting to %s. Hit Ctrl-C to stop.\n", MAIN_JSON_FILE);
+	ready_file = getenv("TRACE_READY_FILE");
+	if (ready_file) {
+		ready_fp = fopen(ready_file, "w");
+		if (!ready_fp) {
+			fprintf(stderr, "Failed to create ready file %s: %s\n",
+				ready_file, strerror(errno));
+			err = -errno;
+			goto cleanup;
+		}
+		fprintf(ready_fp, "ready\n");
+		fclose(ready_fp);
+	}
+
+	printf("Tracing BPF programs... Outputting to %s. Hit Ctrl-C to stop.\n", out_file);
 
 	/* 5. 持续轮询，消费内核吐出的数据 */
 	while (!exiting) {
 		err = ring_buffer__poll(rb, 100);
 		if (err < 0) {
-			if (err == -EINTR) continue; // 忽略被信号打断的 poll
+			if (err == -EINTR) {
+				if (exiting) {
+					err = 0;
+					break;
+				}
+				continue;
+			}
 			printf("Error polling ring buffer: %d\n", err);
 			break;
 		}
@@ -340,10 +382,26 @@ cleanup:
 
 	/* 优雅退出：闭合 JSON 数组 */
 	if (main_json_fp) {
-		fprintf(main_json_fp, "\n]\n");
-		fclose(main_json_fp);
+		if (fprintf(main_json_fp, "\n]\n") < 0 ||
+		    fflush(main_json_fp) != 0) {
+			fprintf(stderr, "Failed to finish %s: %s\n",
+				tmp_out_file, strerror(errno));
+			if (!err)
+				err = -EIO;
+		}
+		if (fclose(main_json_fp) != 0 && !err) {
+			fprintf(stderr, "Failed to close %s: %s\n",
+				tmp_out_file, strerror(errno));
+			err = -errno;
+		}
 	}
 	ring_buffer__free(rb);
 	trace_prog_bpf__destroy(skel);
-	return -err;
+	if (!err && rename(tmp_out_file, out_file) != 0) {
+		fprintf(stderr, "Failed to rename %s to %s: %s\n",
+			tmp_out_file, out_file, strerror(errno));
+		err = -errno;
+	}
+	free(tmp_out_file);
+	return err < 0 ? -err : err;
 }

@@ -1,10 +1,15 @@
 #!/bin/bash
 
+set -uo pipefail
+
 # --- Configuration ---
-OUT_DIR="bpf_trace/test_bpf"
+OUT_DIR="${TRACE_OUTPUT_DIR:-bpf_trace/test_bpf}"
 MODULE_NAME="test_bpf"
-TEST_MODULE="../../../../../lib/test_bpf.ko"
-TRACE_USER="./trace_user"
+TEST_MODULE="${TEST_BPF_MODULE:-../../../../../lib/test_bpf.ko}"
+TRACE_USER="${TRACE_USER:-./trace_user}"
+TRACE_PID=""
+READY_FILE=""
+OLD_JIT=""
 
 # --- 你的多行黑名单配置 (完全支持) ---
 BLACKLIST_RULES=(
@@ -39,8 +44,36 @@ done
 
 # 检查函数保持不变
 is_blacklisted() {
-    [[ -n "${BLACKLIST_MAP[$1]}" ]]
+    [[ -n "${BLACKLIST_MAP[$1]:-}" ]]
 }
+
+cleanup()
+{
+    if [ -n "${TRACE_PID}" ] && kill -0 "${TRACE_PID}" 2>/dev/null; then
+        kill -SIGINT "${TRACE_PID}" 2>/dev/null || true
+        wait "${TRACE_PID}" 2>/dev/null || true
+    fi
+    rmmod "${MODULE_NAME}" 2>/dev/null || true
+    if [ -n "${READY_FILE}" ]; then
+        rm -f "${READY_FILE}"
+    fi
+    if [ -n "${OLD_JIT}" ]; then
+        echo "${OLD_JIT}" > /proc/sys/net/core/bpf_jit_enable 2>/dev/null || true
+    fi
+}
+
+wait_for_tracer()
+{
+    for ((attempt = 0; attempt < 100; attempt++)); do
+        [ -f "${READY_FILE}" ] && return 0
+        kill -0 "${TRACE_PID}" 2>/dev/null || return 1
+        sleep 0.05
+    done
+    return 1
+}
+
+trap cleanup EXIT
+trap 'cleanup; exit 130' INT TERM
 
 # 1. Root Check
 if [ "$EUID" -ne 0 ]; then
@@ -50,7 +83,8 @@ fi
 
 # 2. Environment Setup
 echo "Disabling BPF JIT for consistent tracing..."
-echo 0 | tee /proc/sys/net/core/bpf_jit_enable > /dev/null
+OLD_JIT="$(cat /proc/sys/net/core/bpf_jit_enable)"
+echo 0 > /proc/sys/net/core/bpf_jit_enable
 
 # 3. Validation
 if [ ! -f "$TEST_MODULE" ]; then # 修正：这里用 -f 检查文件更好
@@ -64,9 +98,9 @@ fi
 
 mkdir -p "$OUT_DIR"
 
-START_ID=0
-END_ID=1052   
-BATCH_SIZE=10 
+START_ID="${TEST_BPF_START_ID:-0}"
+END_ID="${TEST_BPF_END_ID:-1052}"
+BATCH_SIZE="${TEST_BPF_BATCH_SIZE:-10}"
 
 echo "Starting automated tracing (Batch size: $BATCH_SIZE, IDs: $START_ID to $END_ID)..."
 
@@ -88,10 +122,19 @@ for (( batch_start=$START_ID; batch_start<=$END_ID; batch_start+=$BATCH_SIZE ));
     echo "=================================================="
     echo "Tracing batch: test_id $batch_start to $batch_end -> $JSON_FILE"
     
-    ./trace_user "$JSON_FILE" &
+    READY_FILE="/tmp/bpf-tracer-ready-$$"
+    rm -f "${READY_FILE}"
+    TRACE_READY_FILE="${READY_FILE}" "${TRACE_USER}" "$JSON_FILE" &
     TRACE_PID=$!
-    
-    sleep 0.5
+
+    if ! wait_for_tracer; then
+        echo "Error: ${TRACE_USER} did not become ready for batch ${batch_start}-${batch_end}."
+        wait "${TRACE_PID}" 2>/dev/null || true
+        TRACE_PID=""
+        rm -f "${READY_FILE}"
+        READY_FILE=""
+        continue
+    fi
     
     # 内层循环
     for (( id=$batch_start; id<=$batch_end; id++ )); do
@@ -103,36 +146,24 @@ for (( batch_start=$START_ID; batch_start<=$END_ID; batch_start+=$BATCH_SIZE ));
         echo "  [+] Running test_id=$id..."
         
         rmmod "$MODULE_NAME" 2>/dev/null || true
-        insmod "$TEST_MODULE" test_id=$id
+        if ! insmod "$TEST_MODULE" test_id=$id; then
+            echo "  [!] test_id=$id failed to load"
+            continue
+        fi
         
         sleep 0.2
         rmmod "$MODULE_NAME" 2>/dev/null || true
     done
     
     echo "  [*] Stopping tracer for batch ${batch_start}-${batch_end}..."
-    kill -SIGINT $TRACE_PID
-    wait $TRACE_PID 2>/dev/null
+    kill -SIGINT "${TRACE_PID}" 2>/dev/null || true
+    wait "${TRACE_PID}" 2>/dev/null || true
+    TRACE_PID=""
+    rm -f "${READY_FILE}"
+    READY_FILE=""
     
     echo "  [v] Done with batch ${batch_start}-${batch_end}"
 done
 
 echo "--------------------------------------------------"
-echo "Done! All traces are perfectly saved in ./$OUT_DIR/"
-
-mkdir -p "$OUT_DIR/empty"
-mkdir -p "$OUT_DIR/error"
-
-for f in "$OUT_DIR"/*.json; do
-    [ -e "$f" ] || continue # 修正：处理文件不存在的情况
-
-    if ! jq . "$f" >/dev/null 2>&1; then
-        echo "Corrupted json file: $f"
-        mv "$f" "$OUT_DIR/error/"
-        continue
-    fi
-
-    if [ "$(jq 'length' "$f")" -eq 0 ]; then
-        echo "Empty json file: $f"
-        mv "$f" "$OUT_DIR/empty/"
-    fi
-done
+echo "Done! Raw trace files are saved in ${OUT_DIR}/ for host validation."

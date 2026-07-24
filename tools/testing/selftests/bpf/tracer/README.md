@@ -1,24 +1,68 @@
 # BPF Trace Recorder
 
-## How to use
+## One-command VM workflow
 
-1. First, goto the `tools/testing/selftests/bpf/tracer` directory and build.
+The host workflow builds the kernel, BPF selftests, tracer, and
+`lib/test_bpf.ko`; installs them into a libbpf CI rootfs; boots the kernel with
+QEMU; runs the selected experiment; and writes JSON files directly to a host
+directory.
 
 ```shell
-cd tools/testing/selftests/bpf/tracer
-make
+./tools/testing/selftests/bpf/tracer/run_vmtest.sh --suite smoke
 ```
 
-2. Then, press `F5` to start the VM.
+The first invocation downloads a libbpf CI rootfs unless a cached
+`$HOME/.bpf_selftests/root.img` already exists. A local rootfs archive can be
+specified explicitly:
 
-3. Finally in VM, goto the directory.
+```shell
+./tools/testing/selftests/bpf/tracer/run_vmtest.sh \
+  --rootfs /path/to/libbpf-vmtest-rootfs.tar.zst \
+  --suite smoke
+```
 
-```bash
-cd /host/home/tyz/Workspace/.../tools/testing/selftests/bpf/tracer
-chmod +x ./run_traces.sh
-./run_traces.sh
-chmod +x ./run_test_bpf.sh
-./run_test_bpf.sh
+Available suites:
+
+```shell
+# A few automatically selected test_progs tests.
+./tools/testing/selftests/bpf/tracer/run_vmtest.sh --suite smoke
+
+# Selected test_progs tests.
+./tools/testing/selftests/bpf/tracer/run_vmtest.sh \
+  --suite test_progs --test tailcalls
+
+# All non-blacklisted test_progs tests.
+./tools/testing/selftests/bpf/tracer/run_vmtest.sh --suite test_progs
+
+# The test_bpf experiment.
+./tools/testing/selftests/bpf/tracer/run_vmtest.sh --suite test_bpf
+
+# Both complete experiments.
+./tools/testing/selftests/bpf/tracer/run_vmtest.sh --suite all
+```
+
+Results are placed under `tracer/results/<timestamp>-<suite>/` by default.
+Pass `--output <directory>` to select another location. The directory contains
+the JSON traces, VM console logs, guest kernel information, the tested Git
+commit, the guest exit status, and `json-validation.tsv`. JSON validation runs
+on the host after the VM exits. Valid non-empty traces remain in their suite
+directory, empty arrays are moved to `empty/`, and invalid or incomplete
+outputs are moved to `error/`.
+
+KVM is required by default. `--allow-tcg` permits QEMU emulation for a smoke
+run, but complete suites are expected to be prohibitively slow without KVM.
+
+Host dependencies include a Linux kernel build toolchain, clang/LLVM,
+`bpftool`, `pahole`, libbpf development files, QEMU, zstd, `jq`, and sudo
+access for mounting the rootfs image. A missing `jq` is reported before the
+build starts. Run `run_vmtest.sh --help` for all options.
+
+The lower-level `vmtest.sh` interface remains available:
+
+```shell
+tools/testing/selftests/bpf/vmtest.sh \
+  -r /absolute/path/to/results \
+  -- ./tracer/guest_run.sh smoke
 ```
 
 ## Overview

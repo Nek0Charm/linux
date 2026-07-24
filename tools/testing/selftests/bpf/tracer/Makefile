@@ -9,6 +9,7 @@ USER_C = trace_user.c
 CLANG ?= clang
 CC ?= gcc
 BPFTOOL ?= bpftool
+VMLINUX_BTF ?= ../../../../../vmlinux
 
 # 编译参数
 CFLAGS := -g -O2 -Wall -I.
@@ -21,10 +22,10 @@ LIBS := -lbpf -lelf -lz
 
 all: $(APP)
 
-# 步骤 1: 从当前运行的内核中导出完整的 vmlinux.h
-vmlinux.h:
+# 步骤 1: 从将要在 VM 中运行的内核导出完整的 vmlinux.h
+vmlinux.h: $(VMLINUX_BTF)
 	@echo "  GEN      vmlinux.h"
-	$(BPFTOOL) btf dump file /sys/kernel/btf/vmlinux format c > vmlinux.h
+	$(BPFTOOL) btf dump file $(VMLINUX_BTF) format c > vmlinux.h
 
 # 步骤 2: 将 eBPF C 代码编译为 BPF 字节码 (.o 文件)
 $(BPF_OBJ): $(BPF_C) vmlinux.h trace_common.h
