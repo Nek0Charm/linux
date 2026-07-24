@@ -21,21 +21,21 @@ int BPF_PROG(on_start, u64 run_id, const struct bpf_prog *prog, u64 ctx_ptr, u64
 	evt->ctx_ptr = ctx_ptr;
 	evt->sp = fp;
 	
-	/* 1. 安全读取 prog->aux 指针 */
+	/* 1. Read the prog->aux pointer safely. */
 	struct bpf_prog_aux *aux = NULL;
 	bpf_probe_read_kernel(&aux, sizeof(aux), &prog->aux);
 
-	/* 2. 读取 id 和 name */
+	/* 2. Read the ID and name. */
 	if (aux) {
 		bpf_probe_read_kernel(&evt->prog_id, sizeof(evt->prog_id), &aux->id);
-		/* bpf_probe_read_kernel_str 会自动处理字符串和 \0 结尾 */
+		/* bpf_probe_read_kernel_str handles strings and the terminating \0 automatically. */
 		bpf_probe_read_kernel_str(evt->prog_name, sizeof(evt->prog_name), aux->name);
 	} else {
 		evt->prog_id = 0;
 		evt->prog_name[0] = '\0';
 	}
 
-	/* ================= 新增：读取 used_maps 生成 mem_blocks ================= */
+	/* ================= Read used_maps to build mem_blocks ================= */
 	evt->block_cnt = 0;
 	if (aux) {
 		u32 used_map_cnt = 0;
@@ -58,19 +58,19 @@ int BPF_PROG(on_start, u64 run_id, const struct bpf_prog *prog, u64 ctx_ptr, u64
 				bpf_probe_read_kernel(&map_type, sizeof(map_type), &map->map_type);
 				if (map_type == BPF_MAP_TYPE_PROG_ARRAY) break;
 
-				/* 块 1: Map FD (不可直接解引用) */
+				/* Block 1: map FD (cannot be dereferenced directly). */
 				evt->blocks[b_idx].base_addr = (u64)map;
 				evt->blocks[b_idx].size = 8; // here must > 0
 				evt->blocks[b_idx].is_direct_value = 0;
 				b_idx++;
 
-				/* 块 2: Map Value (仅 Array Map 等支持直接解引用) */
+				/* Block 2: map value (only array maps and similar types can be dereferenced directly). */
 				if (map_type == BPF_MAP_TYPE_ARRAY) {
 					u32 v_size = 0, m_entries = 0;
 					bpf_probe_read_kernel(&v_size, sizeof(v_size), &map->value_size);
 					bpf_probe_read_kernel(&m_entries, sizeof(m_entries), &map->max_entries);
 					
-					/* 计算 value 数组的首地址：利用 vmlinux.h 中的 struct bpf_array */
+					/* Compute the value array base address using struct bpf_array from vmlinux.h. */
 					evt->blocks[b_idx].base_addr = (u64)map + __builtin_offsetof(struct bpf_array, value);
 					evt->blocks[b_idx].size = v_size * m_entries;
 					evt->blocks[b_idx].is_direct_value = 1;
@@ -82,10 +82,10 @@ int BPF_PROG(on_start, u64 run_id, const struct bpf_prog *prog, u64 ctx_ptr, u64
 	}
 	/* ======================================================================== */
 
-	/* 3. 读取指令数量 prog->len */
+	/* 3. Read the instruction count from prog->len. */
 	bpf_probe_read_kernel(&evt->insn_cnt, sizeof(evt->insn_cnt), &prog->len);
 
-	/* 4. 读取原生未被篡改的字节码 (prog->insnsi 是柔性数组的首地址) */
+	/* 4. Read the original unmodified bytecode (prog->insnsi is the flexible array base). */
 	u32 cnt = evt->insn_cnt;
 	if (cnt > MAX_INSN_DUMP) {
 		cnt = MAX_INSN_DUMP;
@@ -153,7 +153,7 @@ int BPF_PROG(on_tailcall, u64 run_id, const struct bpf_prog *prog, u32 pc, u64 m
 	evt->index = index;
 	evt->prog_ptr = (u64)prog;
 	
-	/* 提取指令序列 */
+	/* Extract the instruction sequence. */
 	bpf_probe_read_kernel(&evt->insn_cnt, sizeof(evt->insn_cnt), &prog->len);
 	__u32 copy_cnt = evt->insn_cnt;
 	if (copy_cnt > MAX_INSN_DUMP) copy_cnt = MAX_INSN_DUMP;

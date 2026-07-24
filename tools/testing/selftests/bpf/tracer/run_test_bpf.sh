@@ -11,7 +11,7 @@ TRACE_PID=""
 READY_FILE=""
 OLD_JIT=""
 
-# --- 你的多行黑名单配置 (完全支持) ---
+# --- Multiline blacklist configuration (fully supported) ---
 BLACKLIST_RULES=(
     "43"                                # BPF_SUB, R0, R0
     "324 329 330 335 336 341 342"       # store
@@ -24,25 +24,25 @@ BLACKLIST_RULES=(
 declare -A BLACKLIST_MAP
 echo "Initializing blacklist..."
 
-# 第一层循环：取出数组里的每一行
+# Outer loop: read each line from the array
 for group in "${BLACKLIST_RULES[@]}"; do
-    # 第二层循环：将每一行按空格拆分成单个元素 (重点在这里：不加引号的 $group)
+    # Inner loop: split each line into space-delimited items (intentionally leave $group unquoted)
     for item in $group; do
         if [[ "$item" =~ ^([0-9]+)-([0-9]+)$ ]]; then
-            # 处理范围格式 (例如 367-450)
+            # Handle a range such as 367-450
             start=${BASH_REMATCH[1]}
             end=${BASH_REMATCH[2]}
             for ((i=start; i<=end; i++)); do
                 BLACKLIST_MAP[$i]=1
             done
         elif [[ "$item" =~ ^[0-9]+$ ]]; then
-            # 处理单个数字格式 (例如 43)
+            # Handle a single number such as 43
             BLACKLIST_MAP[$item]=1
         fi
     done
 done
 
-# 检查函数保持不变
+# The lookup function remains unchanged
 is_blacklisted() {
     [[ -n "${BLACKLIST_MAP[$1]:-}" ]]
 }
@@ -87,7 +87,7 @@ OLD_JIT="$(cat /proc/sys/net/core/bpf_jit_enable)"
 echo 0 > /proc/sys/net/core/bpf_jit_enable
 
 # 3. Validation
-if [ ! -f "$TEST_MODULE" ]; then # 修正：这里用 -f 检查文件更好
+if [ ! -f "$TEST_MODULE" ]; then # Use -f here to verify that this is a file
     echo "Error: $TEST_MODULE not found."
     exit 1
 fi
@@ -109,7 +109,7 @@ if lsmod | grep -q "^${MODULE_NAME} "; then
     rmmod "$MODULE_NAME"
 fi
 
-# 外层循环：按批次步进
+# Outer loop: advance one batch at a time
 for (( batch_start=$START_ID; batch_start<=$END_ID; batch_start+=$BATCH_SIZE )); do
     
     batch_end=$(( batch_start + BATCH_SIZE - 1 ))
@@ -136,7 +136,7 @@ for (( batch_start=$START_ID; batch_start<=$END_ID; batch_start+=$BATCH_SIZE ));
         continue
     fi
     
-    # 内层循环
+    # Inner loop
     for (( id=$batch_start; id<=$batch_end; id++ )); do
         if is_blacklisted "$id"; then
             echo "  [-] Skipping test_id=$id (Blacklisted)"

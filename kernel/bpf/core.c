@@ -72,10 +72,10 @@
 struct bpf_mem_alloc bpf_global_ma;
 bool bpf_global_ma_set;
 
-static atomic64_t bpf_trace_run_id = ATOMIC64_INIT(0);	// 递增的run_id
+static atomic64_t bpf_trace_run_id = ATOMIC64_INIT(0);	// Monotonically increasing run_id
 static DEFINE_PER_CPU(int, bpf_trace_active);
-static DEFINE_PER_CPU(int, bpf_tailcall_entered); // 临时解决方案
-static DEFINE_PER_CPU(u64, bpf_trace_current_run_id);	// 当前bpf程序这一次运行的run_id
+static DEFINE_PER_CPU(int, bpf_tailcall_entered); // Temporary workaround
+static DEFINE_PER_CPU(u64, bpf_trace_current_run_id);	// run_id of the current BPF program invocation
 static DEFINE_PER_CPU(bool, bpf_trace_current_drop);
 DEFINE_PER_CPU(const struct bpf_prog *, bpf_trace_current_prog_ptr);
 EXPORT_SYMBOL_GPL(bpf_trace_current_prog_ptr);
@@ -554,19 +554,19 @@ static bool bpf_interp_trace_taint_access(const struct bpf_insn *insn,
 	return bpf_interp_trace_taint_overlaps(addr, size);
 }
 
-/* 先声明原型，满足编译器的强制规则 */
+/* Declare prototypes first to satisfy compiler requirements. */
 void bpf_interp_hook_start(u64 run_id, const struct bpf_prog *prog, u64 ctx_ptr, u64 fp);
 void bpf_interp_hook_step(u64 run_id, const u64 *regs);
 void bpf_interp_hook_end(u64 run_id, u64 ret);
 void bpf_interp_hook_call(u64 run_id, u64 fp);
 void bpf_interp_hook_tailcall(u64 run_id, const struct bpf_prog *prog, u32 pc, u64 map_ptr, u32 index);
-void bpf_interp_hook_tailcall_map(u64 run_id, const struct bpf_map * map_ptr); // 临时解决方案
+void bpf_interp_hook_tailcall_map(u64 run_id, const struct bpf_map * map_ptr); // Temporary workaround
 void bpf_interp_hook_drop(u64 run_id, u32 reason);
 
-/* 定义三个 noinline 的空函数作为 fentry hook 点。
- * asm("") 防止编译器将其作为死代码优化掉。
+/* Define noinline empty functions as fentry hook points.
+ * asm("") prevents the compiler from eliminating them as dead code.
  */
-/* 强制编译器遵循标准的 ABI 传参调用约定 */
+/* Force the compiler to follow the standard ABI calling convention. */
 noinline void bpf_interp_hook_start(u64 run_id, const struct bpf_prog *prog, u64 ctx_ptr, u64 fp) {
 	asm volatile("" : : "r"(run_id), "r"(prog), "r"(ctx_ptr), "r"(fp) : "memory");
 }
@@ -2287,7 +2287,7 @@ bool bpf_opcode_in_insntable(u8 code)
  */
 static u64 ___bpf_prog_run(u64 *regs, const struct bpf_insn *insn, u64 run_id)
 {
-	const struct bpf_insn *base_insn = insn; // <--- 新增
+	const struct bpf_insn *base_insn = insn; // <--- Added
 #define BPF_INSN_2_LBL(x, y)    [BPF_##x | BPF_##y] = &&x##_##y
 #define BPF_INSN_3_LBL(x, y, z) [BPF_##x | BPF_##y | BPF_##z] = &&x##_##y##_##z
 	static const void * const jumptable[256] __annotate_jump_table = {
@@ -2649,12 +2649,12 @@ select_insn:
 		if (unlikely(run_id > 0 && !this_cpu_read(bpf_trace_active) && !this_cpu_read(bpf_tailcall_entered))) {
 			this_cpu_write(bpf_trace_active, 1);
 			this_cpu_write(bpf_tailcall_entered, 1);
-			/* 将触发本次跳转的 map 指针和 index 一并传出 */
+			/* Pass along the map pointer and index that triggered this jump. */
 			bpf_interp_hook_tailcall_map(run_id, map);
 			this_cpu_write(bpf_trace_active, 0);
 		}
 
-		/* 1. 记录尝试发起的尾调用信息 */
+		/* 1. Record the attempted tail call. */
 		trace_printk("BPF_TAIL_CALL: Attempting... Map: %p, Index: %u, Current tail_call_cnt: %u\n",
 				map, index, tail_call_cnt);
 
@@ -2716,13 +2716,13 @@ select_insn:
 				BPF_INTERP_TRACE_DROP_UNSUPPORTED_TAIL_TARGET);
 			run_id = 0;
 		}
-		/* 2. 记录成功的跳转（记住，执行这行之后，当前程序就一去不复返了） */
+		/* 2. Record the successful jump; the current program never returns after this point. */
 		trace_printk("BPF_TAIL_CALL: SUCCESS - Jumping to new prog (ptr: %p). New cnt: %u\n",
 				prog, tail_call_cnt);
 
 		if (unlikely(run_id > 0 && !this_cpu_read(bpf_trace_active))) {
 			this_cpu_write(bpf_trace_active, 1);
-			/* 将触发本次跳转的 map 指针和 index 一并传出 */
+			/* Pass along the map pointer and index that triggered this jump. */
 			bpf_interp_hook_tailcall(run_id, prog, (u32)(insn - base_insn), (u64)map, index);
 			this_cpu_write(bpf_trace_active, 0);
 		}
@@ -2738,10 +2738,10 @@ select_insn:
 			this_cpu_write(bpf_trace_active, 0);
 		}
 		insn = prog->insnsi;
-		base_insn = insn; // <--- 极其关键：重置新程序的基址！这样后续的 PC 就归零了！
-		goto select_insn; /* 直接把解释器的指令指针（insn）替换掉，重新进入循环 */
+		base_insn = insn; // <--- Critical: reset the base for the new program so its PC starts at zero.
+		goto select_insn; /* Replace the interpreter instruction pointer (insn) and re-enter the loop. */
 out:
-		/* 3. 记录失败后的“继续执行” (Fallthrough) */
+		/* 3. Record execution continuing after a failed tail call (fallthrough). */
 		trace_printk("BPF_TAIL_CALL: FALLTHROUGH - Continuing execution of current prog.\n");
 		CONT;
 	}
@@ -2980,7 +2980,7 @@ static unsigned int PROG_NAME(stack_size)(const void *ctx, const struct bpf_insn
 \
 	prog_ptr = this_cpu_read(bpf_trace_current_prog_ptr); \
 \
-	/* A. 精准过滤：未被递归锁住 + 是正常的 eBPF 程序 + 只在 test_progs 进程中记录 */ \
+	/* A. Filter precisely: not recursively locked, a normal eBPF program, and running in test_progs. */ \
 	if (likely(!this_cpu_read(bpf_trace_active)) && \
 	    !this_cpu_read(bpf_trace_current_drop) && \
 	    prog_ptr && prog_ptr->aux && \
@@ -2991,28 +2991,28 @@ static unsigned int PROG_NAME(stack_size)(const void *ctx, const struct bpf_insn
 		current_run_id = atomic64_inc_return(&bpf_trace_run_id); \
 	} \
 \
-	/* B. 压栈传递给内部调用的 run_id */ \
+	/* B. Save the run_id passed to internal calls. */ \
 	old_run_id = this_cpu_read(bpf_trace_current_run_id); \
 	old_drop = this_cpu_read(bpf_trace_current_drop); \
 	this_cpu_write(bpf_trace_current_run_id, current_run_id); \
 	this_cpu_write(bpf_trace_current_drop, is_target ? false : old_drop); \
 \
-	/* C. 触发 START Hook (仅目标程序) */ \
+	/* C. Trigger the START hook for the target program only. */ \
 	if (unlikely(is_target)) { \
 		old_taint = *this_cpu_ptr(&bpf_trace_taint_state); \
 		memset(this_cpu_ptr(&bpf_trace_taint_state), 0, \
 		       sizeof(struct bpf_interp_trace_taint_state)); \
 		this_cpu_write(bpf_trace_active, 1); \
-		/* 传入 ctx (作为 R1) 和 FP (作为 R10) */ \
+		/* Pass ctx as R1 and FP as R10. */ \
 		bpf_interp_hook_start(current_run_id, prog_ptr, ARG1, FP); \
 		this_cpu_write(bpf_trace_active, 0); \
 	} \
 	this_cpu_write(bpf_tailcall_entered, 0); \
 \
-	/* D. 执行 BPF 主程序，传入 current_run_id (目标程序 >0，非目标程序 ==0) */ \
+	/* D. Run the main BPF program with current_run_id (>0 for the target, 0 otherwise). */ \
 	ret = ___bpf_prog_run(regs, insn, current_run_id); \
 \
-	/* E. 触发 END Hook (仅目标程序) */ \
+	/* E. Trigger the END hook for the target program only. */ \
 	if (unlikely(is_target && !this_cpu_read(bpf_trace_current_drop))) { \
 		this_cpu_write(bpf_trace_active, 1); \
 		bpf_interp_hook_end(current_run_id, ret); \
@@ -3022,7 +3022,7 @@ static unsigned int PROG_NAME(stack_size)(const void *ctx, const struct bpf_insn
 	if (unlikely(is_target)) \
 		*this_cpu_ptr(&bpf_trace_taint_state) = old_taint; \
 \
-	/* F. 恢复旧的 run_id */ \
+	/* F. Restore the previous run_id. */ \
 	this_cpu_write(bpf_trace_current_run_id, old_run_id); \
 	this_cpu_write(bpf_trace_current_drop, old_drop); \
 \
@@ -3047,7 +3047,7 @@ static u64 PROG_NAME_ARGS(stack_size)(u64 r1, u64 r2, u64 r3, u64 r4, u64 r5, \
 	BPF_R5 = r5; \
 	current_run_id = this_cpu_read(bpf_trace_current_run_id); \
 \
-	/* 新增：追踪内部函数调用 (bpf2bpf)，共用主程序的 current_run_id */ \
+	/* Track internal function calls (bpf2bpf) using the main program's current_run_id. */ \
 	if (unlikely(current_run_id > 0 && !this_cpu_read(bpf_trace_active))) { \
 		this_cpu_write(bpf_trace_active, 1); \
 		bpf_interp_hook_call(current_run_id, FP); \

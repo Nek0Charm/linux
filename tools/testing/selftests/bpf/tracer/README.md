@@ -84,7 +84,7 @@ The following 2 hooks need to be removed later.
 
 ```c
 void bpf_interp_hook_tailcall(u64 run_id, const struct bpf_prog *prog, u32 pc, u64 map_ptr, u32 index);
-void bpf_interp_hook_tailcall_map(u64 run_id, const struct bpf_map * map_ptr); // 临时解决方案
+void bpf_interp_hook_tailcall_map(u64 run_id, const struct bpf_map * map_ptr); // Temporary workaround
 ```
 
 ### User part
@@ -99,15 +99,3 @@ void bpf_interp_hook_tailcall_map(u64 run_id, const struct bpf_map * map_ptr); /
 
 * `run_traces.sh`: Automatically generate traces for `./tools/testing/selftests/bpf/test_progs.c`.
 * `run_test_bpf.sh`: Automatically generate traces for `./lib/test_bpf.c`.
-
-## TODO
-
-- [ ] 将测试程序名称的长度上限调大（目前为16个字符）
-
-- [ ] 增加测试程序对应c代码所在文件和行数的信息
-
-- [ ] 将测试程序的指令上限调大（目前为2048条指令，预计要支持几万条）
-
-- [ ] 异步的json打印：先保存到文件，然后离线解析并打印json
-
-- [ ] 修改json文件结构，保存所有bpf_map
