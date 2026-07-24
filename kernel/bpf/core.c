@@ -76,8 +76,68 @@ static atomic64_t bpf_trace_run_id = ATOMIC64_INIT(0);	// 递增的run_id
 static DEFINE_PER_CPU(int, bpf_trace_active);
 static DEFINE_PER_CPU(int, bpf_tailcall_entered); // 临时解决方案
 static DEFINE_PER_CPU(u64, bpf_trace_current_run_id);	// 当前bpf程序这一次运行的run_id
+static DEFINE_PER_CPU(bool, bpf_trace_current_drop);
 DEFINE_PER_CPU(const struct bpf_prog *, bpf_trace_current_prog_ptr);
 EXPORT_SYMBOL_GPL(bpf_trace_current_prog_ptr);
+
+#define BPF_INTERP_TRACE_MAX_INSNS 2048
+#define BPF_INTERP_TRACE_DROP_UNSUPPORTED_TAIL_TARGET 1
+#define BPF_INTERP_TRACE_DROP_TAIL_COUNT_DIVERGENCE 2
+
+static bool bpf_interp_trace_global_map(const struct bpf_map *map)
+{
+	return strnstr(map->name, ".bss", sizeof(map->name)) ||
+	       strnstr(map->name, ".data", sizeof(map->name)) ||
+	       strnstr(map->name, ".rodata", sizeof(map->name)) ||
+	       strnstr(map->name, ".kconfig", sizeof(map->name));
+}
+
+/*
+ * Keep this predicate in terms of features understood by the validator, not
+ * selftest or program names.  A rejected program still executes normally; it
+ * merely runs with run_id == 0 and therefore produces no observer events.
+ */
+static bool bpf_interp_prog_traceable(const struct bpf_prog *prog)
+{
+	const struct bpf_prog_aux *aux;
+	u32 i;
+
+	if (!prog)
+		return false;
+
+	aux = prog->aux;
+	if (!aux)
+		return false;
+
+	/* trace_common.h cannot serialize more instructions or maps than this. */
+	if (prog->len > BPF_INTERP_TRACE_MAX_INSNS || aux->used_map_cnt > 8 ||
+	    (aux->used_map_cnt && !aux->used_maps))
+		return false;
+
+	for (i = 0; i < aux->used_map_cnt; i++) {
+		const struct bpf_map *map = aux->used_maps[i];
+
+		if (!map)
+			continue;
+
+		/* The validator currently allocates these blocks without contents. */
+		if (bpf_interp_trace_global_map(map))
+			return false;
+
+		/* Nested maps and ring-buffer storage are not modeled yet. */
+		switch (map->map_type) {
+		case BPF_MAP_TYPE_ARRAY_OF_MAPS:
+		case BPF_MAP_TYPE_HASH_OF_MAPS:
+		case BPF_MAP_TYPE_RINGBUF:
+		case BPF_MAP_TYPE_USER_RINGBUF:
+			return false;
+		default:
+			break;
+		}
+	}
+
+	return true;
+}
 
 /* 先声明原型，满足编译器的强制规则 */
 void bpf_interp_hook_start(u64 run_id, const struct bpf_prog *prog, u64 ctx_ptr, u64 fp);
@@ -86,6 +146,7 @@ void bpf_interp_hook_end(u64 run_id, u64 ret);
 void bpf_interp_hook_call(u64 run_id, u64 fp);
 void bpf_interp_hook_tailcall(u64 run_id, const struct bpf_prog *prog, u32 pc, u64 map_ptr, u32 index);
 void bpf_interp_hook_tailcall_map(u64 run_id, const struct bpf_map * map_ptr); // 临时解决方案
+void bpf_interp_hook_drop(u64 run_id, u32 reason);
 
 /* 定义三个 noinline 的空函数作为 fentry hook 点。
  * asm("") 防止编译器将其作为死代码优化掉。
@@ -108,6 +169,25 @@ noinline void bpf_interp_hook_tailcall(u64 run_id, const struct bpf_prog *prog, 
 }
 noinline void bpf_interp_hook_tailcall_map(u64 run_id, const struct bpf_map * map_ptr) {
 	asm volatile("" : : "r"(run_id), "r"(map_ptr) : "memory");
+}
+noinline void bpf_interp_hook_drop(u64 run_id, u32 reason)
+{
+	asm volatile("" : : "r"(run_id), "r"(reason) : "memory");
+}
+
+static void bpf_interp_trace_drop_run(u64 run_id, u32 reason)
+{
+	if (!run_id)
+		return;
+
+	if (!this_cpu_read(bpf_trace_active)) {
+		this_cpu_write(bpf_trace_active, 1);
+		bpf_interp_hook_drop(run_id, reason);
+		this_cpu_write(bpf_trace_active, 0);
+	}
+
+	this_cpu_write(bpf_trace_current_drop, true);
+	this_cpu_write(bpf_trace_current_run_id, 0);
 }
 
 /* No hurry in this branch
@@ -1808,6 +1888,7 @@ static u64 ___bpf_prog_run(u64 *regs, const struct bpf_insn *insn, u64 run_id)
 #undef BPF_INSN_3_LBL
 #undef BPF_INSN_2_LBL
 	volatile u32 tail_call_cnt = 0;
+	u32 successful_tail_call_cnt = 0;
 
 #define CONT ({ \
 	if (unlikely(run_id > 0 && !this_cpu_read(bpf_trace_active))) { \
@@ -2128,6 +2209,19 @@ select_insn:
 		}
 
 		if (unlikely(tail_call_cnt >= MAX_TAIL_CALL_CNT)) {
+			/*
+			 * The interpreter charges an in-bounds empty-slot attempt to
+			 * tail_call_cnt, while the JIT-like formal semantics charges only
+			 * a populated slot.  Drop only when that difference changes the
+			 * next control-flow decision.
+			 */
+			if (run_id > 0 &&
+			    successful_tail_call_cnt < MAX_TAIL_CALL_CNT &&
+			    READ_ONCE(array->ptrs[index])) {
+				bpf_interp_trace_drop_run(run_id,
+					BPF_INTERP_TRACE_DROP_TAIL_COUNT_DIVERGENCE);
+				run_id = 0;
+			}
 			trace_printk("BPF_TAIL_CALL: FAIL - Max limit reached (%u)\n", 
 					tail_call_cnt);
 			goto out;
@@ -2139,6 +2233,19 @@ select_insn:
 		if (!prog) {
 			trace_printk("BPF_TAIL_CALL: FAIL - Empty slot at index %u\n", index);
 			goto out;
+		}
+		successful_tail_call_cnt++;
+
+		/*
+		 * The target program can use features absent from the entry program
+		 * (global data is a common example).  Drop the entire observation
+		 * before entering such a target, while leaving the tail call itself
+		 * completely unchanged.
+		 */
+		if (unlikely(run_id > 0 && !bpf_interp_prog_traceable(prog))) {
+			bpf_interp_trace_drop_run(run_id,
+				BPF_INTERP_TRACE_DROP_UNSUPPORTED_TAIL_TARGET);
+			run_id = 0;
 		}
 		/* 2. 记录成功的跳转（记住，执行这行之后，当前程序就一去不复返了） */
 		trace_printk("BPF_TAIL_CALL: SUCCESS - Jumping to new prog (ptr: %p). New cnt: %u\n",
@@ -2394,7 +2501,7 @@ static unsigned int PROG_NAME(stack_size)(const void *ctx, const struct bpf_insn
 	u64 regs[MAX_BPF_EXT_REG] = {}; \
 	u64 old_run_id, current_run_id = 0; \
 	const struct bpf_prog *prog_ptr; \
-	bool is_target = false; \
+	bool old_drop, is_target = false; \
 	u64 ret; \
 \
 	kmsan_unpoison_memory(stack, sizeof(stack)); \
@@ -2405,8 +2512,10 @@ static unsigned int PROG_NAME(stack_size)(const void *ctx, const struct bpf_insn
 \
 	/* A. 精准过滤：未被递归锁住 + 是正常的 eBPF 程序 + 只在 test_progs 进程中记录 */ \
 	if (likely(!this_cpu_read(bpf_trace_active)) && \
+	    !this_cpu_read(bpf_trace_current_drop) && \
 	    prog_ptr && prog_ptr->aux && \
-	    (strncmp(current->comm, "test_progs", 10) == 0 && prog_ptr->aux->id > 0 || \
+	    bpf_interp_prog_traceable(prog_ptr) && \
+	    ((strncmp(current->comm, "test_progs", 10) == 0 && prog_ptr->aux->id > 0) || \
 	     strncmp(current->comm, "insmod", 6) == 0)) { \
 		is_target = true; \
 		current_run_id = atomic64_inc_return(&bpf_trace_run_id); \
@@ -2414,7 +2523,9 @@ static unsigned int PROG_NAME(stack_size)(const void *ctx, const struct bpf_insn
 \
 	/* B. 压栈传递给内部调用的 run_id */ \
 	old_run_id = this_cpu_read(bpf_trace_current_run_id); \
+	old_drop = this_cpu_read(bpf_trace_current_drop); \
 	this_cpu_write(bpf_trace_current_run_id, current_run_id); \
+	this_cpu_write(bpf_trace_current_drop, is_target ? false : old_drop); \
 \
 	/* C. 触发 START Hook (仅目标程序) */ \
 	if (unlikely(is_target)) { \
@@ -2429,7 +2540,7 @@ static unsigned int PROG_NAME(stack_size)(const void *ctx, const struct bpf_insn
 	ret = ___bpf_prog_run(regs, insn, current_run_id); \
 \
 	/* E. 触发 END Hook (仅目标程序) */ \
-	if (unlikely(is_target)) { \
+	if (unlikely(is_target && !this_cpu_read(bpf_trace_current_drop))) { \
 		this_cpu_write(bpf_trace_active, 1); \
 		bpf_interp_hook_end(current_run_id, ret); \
 		this_cpu_write(bpf_trace_active, 0); \
@@ -2437,6 +2548,7 @@ static unsigned int PROG_NAME(stack_size)(const void *ctx, const struct bpf_insn
 \
 	/* F. 恢复旧的 run_id */ \
 	this_cpu_write(bpf_trace_current_run_id, old_run_id); \
+	this_cpu_write(bpf_trace_current_drop, old_drop); \
 \
 	return ret; \
 }

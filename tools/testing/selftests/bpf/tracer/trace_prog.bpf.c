@@ -181,4 +181,21 @@ int BPF_PROG(on_tailcall_map, u64 run_id, const struct bpf_map * map_ptr)
 	return 0;
 }
 
+SEC("fentry/bpf_interp_hook_drop")
+int BPF_PROG(on_drop, u64 run_id, u32 reason)
+{
+	struct evt_prog_drop *evt;
+
+	evt = bpf_ringbuf_reserve(&rb, sizeof(*evt), 0);
+	if (!evt)
+		return 0;
+
+	evt->hdr.run_id = run_id;
+	evt->hdr.type = EVT_PROG_DROP;
+	evt->reason = reason;
+
+	bpf_ringbuf_submit(evt, 0);
+	return 0;
+}
+
 char LICENSE[] SEC("license") = "GPL";

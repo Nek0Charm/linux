@@ -18,6 +18,12 @@ enum trace_evt_type {
 	EVT_PROG_CALL  = 4, // 新增内部调用事件
 	EVT_PROG_TAILCALL = 5,
 	EVT_PROG_TAILCALL_MAP = 6,
+	EVT_PROG_DROP = 7,
+};
+
+enum trace_drop_reason {
+	TRACE_DROP_UNSUPPORTED_TAIL_TARGET = 1,
+	TRACE_DROP_TAIL_COUNT_DIVERGENCE = 2,
 };
 
 /* 基础事件头 */
@@ -70,6 +76,11 @@ struct evt_prog_tailcall_map {
 	struct trace_hdr hdr;
 	__u64 map_ptr;       // 尾调用传入的 Map 指针 (R2)
 	__u32 max_entries;
+};
+
+struct evt_prog_drop {
+	struct trace_hdr hdr;
+	__u32 reason;
 };
 
 #endif /* __TRACE_COMMON_H */

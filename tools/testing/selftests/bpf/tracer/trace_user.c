@@ -48,6 +48,18 @@ static FILE *main_json_fp = NULL;
 static bool is_first_run_in_main = true;
 static volatile bool exiting = false;
 
+static const char *drop_reason_name(__u32 reason)
+{
+	switch (reason) {
+	case TRACE_DROP_UNSUPPORTED_TAIL_TARGET:
+		return "unsupported tail-call target";
+	case TRACE_DROP_TAIL_COUNT_DIVERGENCE:
+		return "tail-call counter divergence";
+	default:
+		return "unknown";
+	}
+}
+
 static void sig_handler(int sig)
 {
 	exiting = true;
@@ -274,13 +286,21 @@ static int handle_event(void *ctx, void *data, size_t data_sz)
 		}
 	} else if (hdr->type == EVT_PROG_TAILCALL_MAP) {
 		struct evt_prog_tailcall_map *evt = data;
-		run = get_or_create_run(hdr->run_id); 
+		run = get_or_create_run(hdr->run_id);
 		
 		if (!run->has_started) run->is_corrupted = true;
 		if (run->is_corrupted) return 0;
 		
 		run->jmp_map_ptr = evt->map_ptr;
 		run->jmp_max_entries = evt->max_entries;
+	} else if (hdr->type == EVT_PROG_DROP) {
+		struct evt_prog_drop *evt = data;
+
+		fprintf(stderr,
+			"[Drop] run_id %llu skipped by observer: %s (reason %u).\n",
+			(unsigned long long)hdr->run_id,
+			drop_reason_name(evt->reason), evt->reason);
+		remove_run(hdr->run_id);
 	}
 	return 0;
 }
