@@ -3,6 +3,12 @@
 
 set -e
 
+if [[ "${EUID}" -eq 0 ]]; then
+    sudo() {
+        "$@"
+    }
+fi
+
 # This script currently only works for the following platforms,
 # as it is based on the VM image used by the BPF CI, which is
 # available only for these architectures. We can also specify

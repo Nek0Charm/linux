@@ -11,12 +11,24 @@ CC ?= gcc
 BPFTOOL ?= bpftool
 VMLINUX_BTF ?= ../../../../../vmlinux
 
+# libbpf built by tools/testing/selftests/bpf/Makefile
+SELFTEST_BPF_DIR := $(abspath ..)
+LIBBPF_INCLUDE := $(SELFTEST_BPF_DIR)/tools/include
+LIBBPF_A := $(SELFTEST_BPF_DIR)/tools/build/libbpf/libbpf.a
+
 # Compiler flags
-CFLAGS := -g -O2 -Wall -I.
-BPF_CFLAGS := -g -O2 -target bpf -D__TARGET_ARCH_x86 -I.
+CFLAGS := -g -O2 -Wall \
+	-I. \
+	-I$(LIBBPF_INCLUDE)
+
+BPF_CFLAGS := -g -O2 \
+	-target bpf \
+	-D__TARGET_ARCH_x86 \
+	-I. \
+	-I$(LIBBPF_INCLUDE)
 
 # Libraries
-LIBS := -lbpf -lelf -lz
+LIBS := $(LIBBPF_A) -lelf -lz
 
 .PHONY: all clean
 

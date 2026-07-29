@@ -97,7 +97,7 @@ if [ "${#TESTS[@]}" -gt 0 ] && [ "${SUITE}" != "test_progs" ]; then
 	exit 2
 fi
 
-for tool in clang bpftool jq make pahole qemu-system-x86_64 zstd sudo; do
+for tool in clang bpftool jq make pahole qemu-system-x86_64 zstd; do
 	if ! command -v "${tool}" >/dev/null 2>&1; then
 		echo "Missing required host tool: ${tool}" >&2
 		exit 1
