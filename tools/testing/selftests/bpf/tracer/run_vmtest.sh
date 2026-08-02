@@ -156,7 +156,7 @@ if [ "${UPDATE_IMAGE}" = "yes" ] || [ ! -f "${CACHE_DIR}/root.img" ]; then
 	VMTEST_ARGS+=(-i)
 fi
 
-git -C "${KERNEL_DIR}" rev-parse HEAD > "${RESULTS_DIR}/git-commit.txt"
+# git -C "${KERNEL_DIR}" rev-parse HEAD > "${RESULTS_DIR}/git-commit.txt"
 printf '%s\n' "${SUITE}" > "${RESULTS_DIR}/suite.txt"
 
 echo "Kernel tree: ${KERNEL_DIR}"
