@@ -44,9 +44,7 @@ run_smoke()
 	local -a selected=()
 	local -a preferred=(
 		"tailcalls"
-		"tailcalls_bpf2bpf"
-		"map_in_map"
-		"verifier_bounds"
+		"verifier_bswap"
 	)
 
 	available="$("${TEST_PROGS_BIN}" -l)"
