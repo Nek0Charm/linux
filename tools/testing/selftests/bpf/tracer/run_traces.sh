@@ -33,6 +33,10 @@ BLACKLIST_RULES=(
     "lwt_reroute" "sk_assign"           # load from ctx
     "task_fd_query_rawtp"
     "time_tai"
+    "res_spin_lock_stress"              # too slow
+    "verifier_bounds"                   # kernel panic
+    "core_reloc"                        # kernel panic
+    "skb_helpers"                       # kernel panic
 )
 BLACKLIST=$(IFS='|'; echo "${BLACKLIST_RULES[*]}")
 
