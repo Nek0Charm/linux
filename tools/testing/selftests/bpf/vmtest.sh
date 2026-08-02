@@ -214,7 +214,7 @@ update_selftests()
 
 	cd "${selftests_dir}"
 	${make_command} ${build_targets}
-	make -C tracer VMLINUX_BTF="${kernel_build_dir}/vmlinux"
+	make -C tracer ARCH="${ARCH}" VMLINUX_BTF="${kernel_build_dir}/vmlinux"
 
 	if [[ ! -f "${test_bpf_module}" ]]; then
 		echo "Could not find ${test_bpf_module}" >&2

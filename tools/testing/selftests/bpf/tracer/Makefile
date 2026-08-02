@@ -11,6 +11,18 @@ CC ?= gcc
 BPFTOOL ?= bpftool
 VMLINUX_BTF ?= ../../../../../vmlinux
 
+# Use the architecture of the kernel being booted, which can differ from the
+# build host for cross-platform vmtest runs.
+BPF_TARGET_ARCH ?= $(ARCH)
+ifeq ($(strip $(BPF_TARGET_ARCH)),)
+BPF_TARGET_ARCH := $(shell uname -m)
+endif
+BPF_TARGET_ARCH := $(patsubst x86_64,x86,$(BPF_TARGET_ARCH))
+BPF_TARGET_ARCH := $(patsubst aarch64,arm64,$(BPF_TARGET_ARCH))
+ifeq ($(filter x86 arm64,$(BPF_TARGET_ARCH)),)
+$(error Unsupported BPF target architecture: $(BPF_TARGET_ARCH))
+endif
+
 # libbpf built by tools/testing/selftests/bpf/Makefile
 SELFTEST_BPF_DIR := $(abspath ..)
 LIBBPF_INCLUDE := $(SELFTEST_BPF_DIR)/tools/include
@@ -23,7 +35,7 @@ CFLAGS := -g -O2 -Wall \
 
 BPF_CFLAGS := -g -O2 \
 	-target bpf \
-	-D__TARGET_ARCH_x86 \
+	-D__TARGET_ARCH_$(BPF_TARGET_ARCH) \
 	-I. \
 	-I$(LIBBPF_INCLUDE)
 

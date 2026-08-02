@@ -15,6 +15,16 @@ ALLOW_TCG="no"
 JOBS="$(nproc)"
 declare -a TESTS=()
 
+PLATFORM="${PLATFORM:-$(uname -m)}"
+case "${PLATFORM}" in
+x86_64) QEMU_BINARY="qemu-system-x86_64" ;;
+aarch64) QEMU_BINARY="qemu-system-aarch64" ;;
+*)
+	echo "Unsupported architecture: ${PLATFORM}; only x86_64 and aarch64 are supported." >&2
+	exit 1
+	;;
+esac
+
 usage()
 {
 	cat <<EOF
@@ -97,7 +107,7 @@ if [ "${#TESTS[@]}" -gt 0 ] && [ "${SUITE}" != "test_progs" ]; then
 	exit 2
 fi
 
-for tool in clang bpftool jq make pahole qemu-system-x86_64 zstd; do
+for tool in clang bpftool jq make pahole "${QEMU_BINARY}" zstd; do
 	if ! command -v "${tool}" >/dev/null 2>&1; then
 		echo "Missing required host tool: ${tool}" >&2
 		exit 1
