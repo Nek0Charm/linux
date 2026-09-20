@@ -83,7 +83,6 @@ EXPORT_SYMBOL_GPL(bpf_trace_current_prog_ptr);
 #define BPF_INTERP_TRACE_MAX_INSNS 2048
 #define BPF_INTERP_TRACE_MAX_TAINT_RANGES 8
 #define BPF_INTERP_TRACE_DROP_UNSUPPORTED_TAIL_TARGET 1
-#define BPF_INTERP_TRACE_DROP_TAIL_COUNT_DIVERGENCE 2
 #define BPF_INTERP_TRACE_DROP_CTX_INDIRECTION 3
 #define BPF_INTERP_TRACE_DROP_HELPER_MEMORY_SIDE_EFFECT 4
 #define BPF_INTERP_TRACE_DROP_CTX_INTERNAL_STATE 5
@@ -2308,7 +2307,6 @@ static u64 ___bpf_prog_run(u64 *regs, const struct bpf_insn *insn, u64 run_id)
 #undef BPF_INSN_3_LBL
 #undef BPF_INSN_2_LBL
 	volatile u32 tail_call_cnt = 0;
-	u32 successful_tail_call_cnt = 0;
 
 #define CONT ({ \
 	if (unlikely(run_id > 0 && !this_cpu_read(bpf_trace_active))) { \
@@ -2664,19 +2662,6 @@ select_insn:
 		}
 
 		if (unlikely(tail_call_cnt >= MAX_TAIL_CALL_CNT)) {
-			/*
-			 * The interpreter charges an in-bounds empty-slot attempt to
-			 * tail_call_cnt, while the JIT-like formal semantics charges only
-			 * a populated slot.  Drop only when that difference changes the
-			 * next control-flow decision.
-			 */
-			if (run_id > 0 &&
-			    successful_tail_call_cnt < MAX_TAIL_CALL_CNT &&
-			    READ_ONCE(array->ptrs[index])) {
-				bpf_interp_trace_drop_run(run_id,
-					BPF_INTERP_TRACE_DROP_TAIL_COUNT_DIVERGENCE);
-				run_id = 0;
-			}
 			trace_printk("BPF_TAIL_CALL: FAIL - Max limit reached (%u)\n", 
 					tail_call_cnt);
 			goto out;
@@ -2689,8 +2674,6 @@ select_insn:
 			trace_printk("BPF_TAIL_CALL: FAIL - Empty slot at index %u\n", index);
 			goto out;
 		}
-		successful_tail_call_cnt++;
-
 		/*
 		 * The target program can use features absent from the entry program
 		 * (global data is a common example).  Drop the entire observation

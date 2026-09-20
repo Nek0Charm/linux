@@ -53,8 +53,6 @@ static const char *drop_reason_name(__u32 reason)
 	switch (reason) {
 	case TRACE_DROP_UNSUPPORTED_TAIL_TARGET:
 		return "unsupported tail-call target";
-	case TRACE_DROP_TAIL_COUNT_DIVERGENCE:
-		return "tail-call counter divergence";
 	case TRACE_DROP_CTX_INDIRECTION:
 		return "unmodeled context-pointer indirection";
 	case TRACE_DROP_HELPER_MEMORY_SIDE_EFFECT:
