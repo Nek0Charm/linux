@@ -13,11 +13,8 @@ OLD_JIT=""
 
 # --- Multiline blacklist configuration (fully supported) ---
 BLACKLIST_RULES=(
-    "43"                                # BPF_SUB, R0, R0
-    "324 329 330 335 336 341 342"       # store
     "367-450 729-748 758-762 892-931"   # atomic
     "851-891 932-979"                   # pc oob
-    "980-984 988 989 993 994"           # some reason
     "1000-1052"                         # pc oob
 )
 
