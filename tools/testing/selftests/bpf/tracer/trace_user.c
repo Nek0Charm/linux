@@ -61,8 +61,6 @@ static const char *drop_reason_name(__u32 reason)
 		return "unmodeled helper memory side effect";
 	case TRACE_DROP_CTX_INTERNAL_STATE:
 		return "unmodeled kernel context state";
-	case TRACE_DROP_TAIL_INDEX_TRUNCATION:
-		return "tail-call index truncation divergence";
 	case TRACE_DROP_MAP_VALUE_ACCESS:
 		return "unmodeled array-map value access";
 	default:

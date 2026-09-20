@@ -87,7 +87,6 @@ EXPORT_SYMBOL_GPL(bpf_trace_current_prog_ptr);
 #define BPF_INTERP_TRACE_DROP_CTX_INDIRECTION 3
 #define BPF_INTERP_TRACE_DROP_HELPER_MEMORY_SIDE_EFFECT 4
 #define BPF_INTERP_TRACE_DROP_CTX_INTERNAL_STATE 5
-#define BPF_INTERP_TRACE_DROP_TAIL_INDEX_TRUNCATION 6
 #define BPF_INTERP_TRACE_DROP_MAP_VALUE_ACCESS 7
 
 struct bpf_interp_trace_taint_range {
@@ -2662,19 +2661,6 @@ select_insn:
 			trace_printk("BPF_TAIL_CALL: FAIL - Index out of bounds (%u >= %u)\n", 
 					index, array->map.max_entries);
 			goto out;
-		}
-
-		/*
-		 * The interpreter truncates R3 to u32, while the validator's
-		 * current tail-call model checks all 64 bits.  Drop only when the
-		 * truncation selects a populated slot and therefore changes control
-		 * flow immediately.
-		 */
-		if (unlikely(run_id > 0 && BPF_R3 != (u64)index &&
-			     READ_ONCE(array->ptrs[index]))) {
-			bpf_interp_trace_drop_run(run_id,
-				BPF_INTERP_TRACE_DROP_TAIL_INDEX_TRUNCATION);
-			run_id = 0;
 		}
 
 		if (unlikely(tail_call_cnt >= MAX_TAIL_CALL_CNT)) {
