@@ -523,6 +523,7 @@ struct bpf_iarray {
 };
 
 struct bpf_insn_aux_data {
+	u32 interp_helper_id; /* saved before helper address fixup; zero if absent */
 	union {
 		enum bpf_reg_type ptr_type;	/* pointer type for load/store insns */
 		struct bpf_map_ptr_state map_ptr_state;

@@ -1654,7 +1654,15 @@ struct bpf_stream_stage {
 	int len;
 };
 
+/* Helper identity at a PC in the final interpreter instruction stream. */
+struct bpf_interp_helper_call {
+	u32 pc;
+	u32 helper_id;
+};
+
 struct bpf_prog_aux {
+	struct bpf_interp_helper_call *interp_helper_calls;
+	u32 interp_helper_call_cnt;
 	atomic64_t refcnt;
 	u32 used_map_cnt;
 	u32 used_btf_cnt;

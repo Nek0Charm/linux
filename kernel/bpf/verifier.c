@@ -23068,6 +23068,40 @@ out_undo_insn:
 	return err;
 }
 
+static int save_interp_helper_calls(struct bpf_verifier_env *env)
+{
+	struct bpf_prog *prog = env->prog;
+	struct bpf_interp_helper_call *calls;
+	u32 i, count = 0;
+
+	/* Aux data follows instruction expansion/removal. Collect only calls
+	 * that survived rewriting, after the last instruction insertion pass.
+	 */
+	for (i = 0; i < prog->len; i++)
+		if (env->insn_aux_data[i].interp_helper_id &&
+		    prog->insnsi[i].code == (BPF_JMP | BPF_CALL) &&
+		    !prog->insnsi[i].src_reg)
+			count++;
+	if (!count)
+		return 0;
+
+	calls = kvcalloc(count, sizeof(*calls), GFP_KERNEL_ACCOUNT);
+	if (!calls)
+		return -ENOMEM;
+	prog->aux->interp_helper_calls = calls;
+	prog->aux->interp_helper_call_cnt = count;
+	for (i = 0; i < prog->len; i++) {
+		if (!env->insn_aux_data[i].interp_helper_id ||
+		    prog->insnsi[i].code != (BPF_JMP | BPF_CALL) ||
+		    prog->insnsi[i].src_reg)
+			continue;
+		calls->pc = i;
+		calls->helper_id = env->insn_aux_data[i].interp_helper_id;
+		calls++;
+	}
+	return 0;
+}
+
 static int fixup_call_args(struct bpf_verifier_env *env)
 {
 #ifndef CONFIG_BPF_JIT_ALWAYS_ON
@@ -23940,6 +23974,7 @@ static int do_misc_fixups(struct bpf_verifier_env *env)
 				     (void *(*)(struct bpf_map *map, void *key, u32 cpu))NULL));
 
 patch_map_ops_generic:
+			env->insn_aux_data[i + delta].interp_helper_id = insn->imm;
 			switch (insn->imm) {
 			case BPF_FUNC_map_lookup_elem:
 				insn->imm = BPF_CALL_IMM(ops->map_lookup_elem);
@@ -24223,6 +24258,7 @@ patch_map_ops_generic:
 			goto next_insn;
 		}
 patch_call_imm:
+		env->insn_aux_data[i + delta].interp_helper_id = insn->imm;
 		fn = env->ops->get_func_proto(insn->imm, env->prog);
 		/* all functions that have prototype and verifier allowed
 		 * programs to call them, must be real in-kernel functions
@@ -26138,6 +26174,8 @@ skip_full_check:
 								     : false;
 	}
 
+	if (ret == 0)
+		ret = save_interp_helper_calls(env);
 	if (ret == 0)
 		ret = fixup_call_args(env);
 

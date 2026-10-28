@@ -830,6 +830,7 @@ void __bpf_prog_free(struct bpf_prog *fp)
 		mutex_destroy(&fp->aux->dst_mutex);
 		mutex_destroy(&fp->aux->st_ops_assoc_mutex);
 		kfree(fp->aux->poke_tab);
+		kvfree(fp->aux->interp_helper_calls);
 		kfree(fp->aux);
 	}
 	free_percpu(fp->stats);
