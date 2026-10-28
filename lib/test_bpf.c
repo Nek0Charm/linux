@@ -15466,11 +15466,33 @@ static __init int prepare_tail_call_tests(struct bpf_array **pprogs)
 		fp->aux->stack_depth = test->stack_depth;
 		fp->aux->tail_call_reachable = test->has_tail_call;
 		memcpy(fp->insnsi, test->insns, len * sizeof(struct bpf_insn));
+		/* These programs bypass the verifier. Preserve standard helper IDs
+		 * here before relocating calls; bpf_test_func has no public ID.
+		 */
+		for (i = 0; i < len; i++) {
+			struct bpf_insn *insn = &fp->insnsi[i];
+
+			if (insn->code == (BPF_JMP | BPF_CALL) &&
+			    insn->src_reg == BPF_PSEUDO_CALL &&
+			    (u32)insn->imm < __BPF_FUNC_MAX_ID)
+				fp->aux->interp_helper_call_cnt++;
+		}
+		if (fp->aux->interp_helper_call_cnt) {
+			fp->aux->interp_helper_calls =
+				kvcalloc(fp->aux->interp_helper_call_cnt,
+					 sizeof(*fp->aux->interp_helper_calls), GFP_KERNEL);
+			if (!fp->aux->interp_helper_calls) {
+				bpf_prog_free(fp);
+				goto out_nomem;
+			}
+			fp->aux->interp_helper_call_cnt = 0;
+		}
 
 		/* Relocate runtime tail call offsets and addresses */
 		for (i = 0; i < len; i++) {
 			struct bpf_insn *insn = &fp->insnsi[i];
 			long addr = 0;
+			u32 helper_id;
 
 			switch (insn->code) {
 			case BPF_LD | BPF_DW | BPF_IMM:
@@ -15518,9 +15540,19 @@ static __init int prepare_tail_call_tests(struct bpf_array **pprogs)
 					err = -EFAULT;
 					goto out_err;
 				}
+				helper_id = insn->imm;
+
 				*insn = BPF_EMIT_CALL(addr);
 				if ((long)__bpf_call_base + insn->imm != addr)
 					*insn = BPF_JMP_A(0); /* Skip: NOP */
+				else if (helper_id < __BPF_FUNC_MAX_ID) {
+					struct bpf_interp_helper_call *call;
+
+					call = &fp->aux->interp_helper_calls[
+						fp->aux->interp_helper_call_cnt++];
+					call->pc = i;
+					call->helper_id = helper_id;
+				}
 				break;
 			}
 		}
