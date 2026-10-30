@@ -1157,6 +1157,10 @@ bool sk_filter_charge(struct sock *sk, struct sk_filter *fp);
 void sk_filter_uncharge(struct sock *sk, struct sk_filter *fp);
 
 u64 __bpf_call_base(u64 r1, u64 r2, u64 r3, u64 r4, u64 r5);
+void bpf_interp_hook_start(u64 run_id, const struct bpf_prog *prog,
+			   u64 ctx_ptr, u64 fp, u32 stack_size);
+void bpf_interp_hook_step(u64 run_id, const u64 *regs, u32 stack_size);
+void bpf_interp_hook_call(u64 run_id, u64 fp, u32 stack_size);
 #define __bpf_call_base_args \
 	((u64 (*)(u64, u64, u64, u64, u64, const struct bpf_insn *)) \
 	 (void *)__bpf_call_base)

@@ -74,10 +74,10 @@ This project is composed of kernel part and user part.
 The following 4 hooks are defined and used in `core.c`.
 
 ```c
-void bpf_interp_hook_start(u64 run_id, const struct bpf_prog *prog, u64 ctx_ptr, u64 fp);
-void bpf_interp_hook_step(u64 run_id, const u64 *regs);
+void bpf_interp_hook_start(u64 run_id, const struct bpf_prog *prog, u64 ctx_ptr, u64 fp, u32 stack_size);
+void bpf_interp_hook_step(u64 run_id, const u64 *regs, u32 stack_size);
 void bpf_interp_hook_end(u64 run_id, u64 ret);
-void bpf_interp_hook_call(u64 run_id, u64 fp);
+void bpf_interp_hook_call(u64 run_id, u64 fp, u32 stack_size);
 ```
 
 The following 2 hooks need to be removed later.
@@ -94,6 +94,42 @@ void bpf_interp_hook_tailcall_map(u64 run_id, const struct bpf_map * map_ptr); /
   * When executed, emit an event to ring buffer.
 * `trace_user.c`: Load and attach BPF programs in `trace_prog.bpf.c`.
   * Receive the events in ring buffer and print json files.
+
+### Stack memory
+
+`mem_blocks` also contains `type: "stack"` entries for the main and BPF
+subprogram stacks. Each entry describes the actual interpreter allocation:
+`base_addr = R10 - size`, with `size` between 32 and 512 bytes. Repeated
+calls using the same base address and size share a descriptor; `sp_list`
+continues to record individual calls.
+
+`stack_trace[i]` is captured together with `trace[i]`, after the same
+instruction, and describes the **current frame**:
+
+```json
+{ "base_addr": "0x1000", "size": 32, "bytes": "0000000000000000000000000000000000000000000000002a00000000000000" }
+```
+
+`bytes` contains exactly `size` bytes, in increasing address order, encoded
+as two hexadecimal digits per byte. The last byte is at `R10 - 1`. Stack
+read failures discard the run instead of supplying zero-filled snapshots.
+Snapshots are streamed to a temporary file to avoid retaining all steps in
+userspace memory.
+
+These are raw observations: unused or uninitialized stack bytes can contain
+arbitrary values and must not be imported as initialized semantic memory.
+There is no entry-time snapshot or simultaneous snapshot of suspended caller
+frames. A helper's writes into the current frame appear in its post-call
+step if the run remains traceable; existing helper-memory filters still apply.
+
+Consumers must distinguish `stack` from map blocks and avoid allocating a
+second semantic stack for descriptors already represented by `sp_list`.
+The kernel and tracer must be rebuilt together because hook signatures and
+ring-buffer event layouts have changed. Per-step events now carry up to
+512 additional bytes, increasing output size and ring-buffer traffic.
+
+After building, `make -C tools/testing/selftests/bpf/tracer test` runs host
+tests for snapshot serialization, frame sizes, byte order, and read failures.
 
 ### Scripts
 
