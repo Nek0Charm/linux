@@ -43,6 +43,9 @@
 #include <linux/execmem.h>
 #include <crypto/sha2.h>
 
+#define CREATE_TRACE_POINTS
+#include <trace/events/bpf_interp.h>
+
 #include <asm/barrier.h>
 #include <linux/unaligned.h>
 
@@ -74,34 +77,16 @@ bool bpf_global_ma_set;
 
 static atomic64_t bpf_trace_run_id = ATOMIC64_INIT(0);	// Monotonically increasing run_id
 static DEFINE_PER_CPU(int, bpf_trace_active);
-static DEFINE_PER_CPU(int, bpf_tailcall_entered); // Temporary workaround
-static DEFINE_PER_CPU(u64, bpf_trace_current_run_id);	// run_id of the current BPF program invocation
+static DEFINE_PER_CPU(u64, bpf_trace_current_run_id);
 static DEFINE_PER_CPU(bool, bpf_trace_current_drop);
 DEFINE_PER_CPU(const struct bpf_prog *, bpf_trace_current_prog_ptr);
 EXPORT_SYMBOL_GPL(bpf_trace_current_prog_ptr);
 
-#define BPF_INTERP_TRACE_MAX_INSNS 2048
-#define BPF_INTERP_TRACE_MAX_TAINT_RANGES 8
-
-#define BPF_INTERP_TRACE_DROP_UNSUPPORTED_TAIL_TARGET 1
-#define BPF_INTERP_TRACE_DROP_CTX_INDIRECTION 2
-#define BPF_INTERP_TRACE_DROP_HELPER_MEMORY_SIDE_EFFECT 3
-#define BPF_INTERP_TRACE_DROP_CTX_INTERNAL_STATE 4
-#define BPF_INTERP_TRACE_DROP_MAP_VALUE_ACCESS 5
-
-struct bpf_interp_trace_taint_range {
-	u64 start;
-	u64 end;
-};
-
-struct bpf_interp_trace_taint_state {
-	u32 count;
-	struct bpf_interp_trace_taint_range
-		ranges[BPF_INTERP_TRACE_MAX_TAINT_RANGES];
-};
-
-static DEFINE_PER_CPU(struct bpf_interp_trace_taint_state,
-			      bpf_trace_taint_state);
+#define BPF_INTERP_TRACE_MAX_INSNS TRACE_MAX_INSNS
+#define BPF_INTERP_TRACE_DROP_UNSUPPORTED_TAIL_TARGET TRACE_DROP_UNSUPPORTED_TAIL_TARGET
+#define BPF_INTERP_TRACE_DROP_CTX_INDIRECTION TRACE_DROP_CTX_INDIRECTION
+#define BPF_INTERP_TRACE_DROP_CTX_INTERNAL_STATE TRACE_DROP_CTX_INTERNAL_STATE
+#define BPF_INTERP_TRACE_DROP_MAP_VALUE_ACCESS TRACE_DROP_MAP_VALUE_ACCESS
 
 static bool bpf_interp_trace_global_map(const struct bpf_map *map)
 {
@@ -267,157 +252,9 @@ bpf_interp_trace_current_ctx_internal_state(const struct bpf_insn *base_insn,
 	return bpf_interp_trace_ctx_internal_state(prog, base_insn, insn);
 }
 
-/*
- * The verifier replaces a helper ID with its function offset.  Return the
- * helper's possible output region for helpers whose memory effects are not
- * modeled by the validator; a zero size means that no taint is needed.
- */
-static size_t bpf_interp_trace_output(const struct bpf_insn *insn,
-				      const u64 *regs, u64 *output)
-{
-	typeof(__bpf_call_base) *func;
-
-	if (insn->code != (BPF_JMP | BPF_CALL) || insn->src_reg)
-		return 0;
-
-	func = __bpf_call_base + insn->imm;
-	if (func == bpf_strtol_proto.func || func == bpf_strtoul_proto.func) {
-		*output = regs[BPF_REG_4];
-		return sizeof(u64);
-	}
-
-#ifdef CONFIG_NET
-	if (func == bpf_skb_load_bytes ||
-	    func == bpf_skb_load_bytes_relative) {
-		*output = regs[BPF_REG_3];
-		return regs[BPF_REG_4] > SIZE_MAX ? SIZE_MAX : regs[BPF_REG_4];
-	}
-#endif
-
-#ifdef CONFIG_CGROUP_BPF
-	if (func == bpf_sysctl_get_name ||
-	    func == bpf_sysctl_get_current_value ||
-	    func == bpf_sysctl_get_new_value) {
-		*output = regs[BPF_REG_2];
-		return regs[BPF_REG_3] > SIZE_MAX ? SIZE_MAX : regs[BPF_REG_3];
-	}
-#endif
-
-	return 0;
-}
-
 static bool bpf_interp_trace_range(u64 addr, size_t size, u64 *end)
 {
-	return size && !check_add_overflow(addr, (u64)size, end);
-}
-
-static bool bpf_interp_trace_taint_overlaps(u64 addr, size_t size)
-{
-	struct bpf_interp_trace_taint_state *state;
-	u64 end;
-	u32 i;
-
-	if (!bpf_interp_trace_range(addr, size, &end))
-		return false;
-
-	state = this_cpu_ptr(&bpf_trace_taint_state);
-	for (i = 0; i < state->count; i++) {
-		const struct bpf_interp_trace_taint_range *range;
-
-		range = &state->ranges[i];
-		if (addr < range->end && range->start < end)
-			return true;
-	}
-
-	return false;
-}
-
-static bool bpf_interp_trace_taint_add(u64 addr, size_t size)
-{
-	struct bpf_interp_trace_taint_state *state;
-	u64 end;
-	u32 i;
-
-	if (!size)
-		return true;
-	if (!bpf_interp_trace_range(addr, size, &end))
-		return false;
-
-	state = this_cpu_ptr(&bpf_trace_taint_state);
-	for (i = 0; i < state->count; i++) {
-		struct bpf_interp_trace_taint_range *range;
-
-		range = &state->ranges[i];
-		if (addr <= range->end && range->start <= end) {
-			range->start = min(range->start, addr);
-			range->end = max(range->end, end);
-			return true;
-		}
-	}
-
-	if (state->count == BPF_INTERP_TRACE_MAX_TAINT_RANGES)
-		return false;
-
-	state->ranges[state->count].start = addr;
-	state->ranges[state->count].end = end;
-	state->count++;
-	return true;
-}
-
-static void bpf_interp_trace_taint_remove(u32 index)
-{
-	struct bpf_interp_trace_taint_state *state;
-
-	state = this_cpu_ptr(&bpf_trace_taint_state);
-	state->count--;
-	state->ranges[index] = state->ranges[state->count];
-}
-
-static void bpf_interp_trace_taint_clear(u64 addr, size_t size)
-{
-	struct bpf_interp_trace_taint_state *state;
-	u64 end;
-	u32 i = 0;
-
-	if (!bpf_interp_trace_range(addr, size, &end))
-		return;
-
-	state = this_cpu_ptr(&bpf_trace_taint_state);
-	while (i < state->count) {
-		struct bpf_interp_trace_taint_range *range;
-
-		range = &state->ranges[i];
-		if (end <= range->start || range->end <= addr) {
-			i++;
-			continue;
-		}
-
-		if (addr <= range->start && range->end <= end) {
-			bpf_interp_trace_taint_remove(i);
-			continue;
-		}
-
-		if (addr <= range->start) {
-			range->start = end;
-			i++;
-			continue;
-		}
-
-		if (range->end <= end) {
-			range->end = addr;
-			i++;
-			continue;
-		}
-
-		/* A middle overwrite splits one tainted range into two. */
-		if (state->count < BPF_INTERP_TRACE_MAX_TAINT_RANGES) {
-			state->ranges[state->count].start = end;
-			state->ranges[state->count].end = range->end;
-			state->count++;
-			range->end = addr;
-		}
-		i++;
-	}
+	return !check_add_overflow(addr, (u64)size, end);
 }
 
 static size_t bpf_interp_trace_access_size(const struct bpf_insn *insn)
@@ -512,103 +349,7 @@ static bool bpf_interp_trace_map_value_access(const struct bpf_insn *insn,
  * BPF stores are modeled by the validator, so they clear the bytes they fully
  * define and can make a later load traceable again.
  */
-static bool bpf_interp_trace_taint_access(const struct bpf_insn *insn,
-					  const u64 *regs)
-{
-	size_t size = bpf_interp_trace_access_size(insn);
-	u8 class = BPF_CLASS(insn->code);
-	u8 mode = BPF_MODE(insn->code);
-	u64 addr;
-
-	if (!size)
-		return false;
-
-	if (class == BPF_LDX &&
-	    (mode == BPF_MEM || mode == BPF_MEMSX ||
-	     mode == BPF_PROBE_MEM || mode == BPF_PROBE_MEMSX)) {
-		addr = regs[insn->src_reg] + insn->off;
-		return bpf_interp_trace_taint_overlaps(addr, size);
-	}
-
-	if ((class == BPF_ST || class == BPF_STX) && mode == BPF_MEM) {
-		addr = regs[insn->dst_reg] + insn->off;
-		bpf_interp_trace_taint_clear(addr, size);
-		return false;
-	}
-
-	if (class != BPF_STX || mode != BPF_ATOMIC)
-		return false;
-
-	if (insn->imm == BPF_LOAD_ACQ) {
-		addr = regs[insn->src_reg] + insn->off;
-		return bpf_interp_trace_taint_overlaps(addr, size);
-	}
-
-	addr = regs[insn->dst_reg] + insn->off;
-	if (insn->imm == BPF_STORE_REL) {
-		bpf_interp_trace_taint_clear(addr, size);
-		return false;
-	}
-
-	return bpf_interp_trace_taint_overlaps(addr, size);
-}
-
-/* Declare prototypes first to satisfy compiler requirements. */
-void bpf_interp_hook_start(u64 run_id, const struct bpf_prog *prog, u64 ctx_ptr, u64 fp);
-void bpf_interp_hook_step(u64 run_id, const u64 *regs);
-void bpf_interp_hook_end(u64 run_id, u64 ret);
-void bpf_interp_hook_call(u64 run_id, u64 fp);
-void bpf_interp_hook_tailcall(u64 run_id, const struct bpf_prog *prog, u32 pc, u64 map_ptr, u32 index);
-void bpf_interp_hook_tailcall_map(u64 run_id, const struct bpf_map * map_ptr); // Temporary workaround
-void bpf_interp_hook_drop(u64 run_id, u32 reason);
-
-/* Define noinline empty functions as fentry hook points.
- * asm("") prevents the compiler from eliminating them as dead code.
- */
-/* Force the compiler to follow the standard ABI calling convention. */
-noinline void bpf_interp_hook_start(u64 run_id, const struct bpf_prog *prog, u64 ctx_ptr, u64 fp) {
-	asm volatile("" : : "r"(run_id), "r"(prog), "r"(ctx_ptr), "r"(fp) : "memory");
-}
-noinline void bpf_interp_hook_step(u64 run_id, const u64 *regs) {
-	asm volatile("" : : "r"(run_id), "r"(regs) : "memory");
-}
-noinline void bpf_interp_hook_end(u64 run_id, u64 ret) {
-	asm volatile("" : : "r"(run_id), "r"(ret) : "memory");
-}
-noinline void bpf_interp_hook_call(u64 run_id, u64 fp) {
-	asm volatile("" : : "r"(run_id), "r"(fp) : "memory");
-}
-noinline void bpf_interp_hook_tailcall(u64 run_id, const struct bpf_prog *prog, u32 pc, u64 map_ptr, u32 index) {
-	asm volatile("" : : "r"(run_id), "r"(prog), "r"(pc), "r"(map_ptr), "r"(index) : "memory");
-}
-noinline void bpf_interp_hook_tailcall_map(u64 run_id, const struct bpf_map * map_ptr) {
-	asm volatile("" : : "r"(run_id), "r"(map_ptr) : "memory");
-}
-noinline void bpf_interp_hook_drop(u64 run_id, u32 reason)
-{
-	asm volatile("" : : "r"(run_id), "r"(reason) : "memory");
-}
-
-static void bpf_interp_trace_drop_run(u64 run_id, u32 reason)
-{
-	if (!run_id)
-		return;
-
-	if (!this_cpu_read(bpf_trace_active)) {
-		this_cpu_write(bpf_trace_active, 1);
-		bpf_interp_hook_drop(run_id, reason);
-		this_cpu_write(bpf_trace_active, 0);
-	}
-
-	this_cpu_write(bpf_trace_current_drop, true);
-	this_cpu_write(bpf_trace_current_run_id, 0);
-}
-
-static void bpf_interp_trace_drop_helper_memory(u64 run_id)
-{
-	bpf_interp_trace_drop_run(run_id,
-				  BPF_INTERP_TRACE_DROP_HELPER_MEMORY_SIDE_EFFECT);
-}
+#include "interp_trace.h"
 
 /* No hurry in this branch
  *
@@ -2285,7 +2026,8 @@ bool bpf_opcode_in_insntable(u8 code)
  *
  * Return: whatever value is in %BPF_R0 at program exit
  */
-static u64 ___bpf_prog_run(u64 *regs, const struct bpf_insn *insn, u64 run_id)
+static u64 ___bpf_prog_run(u64 *regs, const struct bpf_insn *insn,
+			  u64 run_id)
 {
 	const struct bpf_insn *base_insn = insn; // <--- Added
 #define BPF_INSN_2_LBL(x, y)    [BPF_##x | BPF_##y] = &&x##_##y
@@ -2313,7 +2055,7 @@ static u64 ___bpf_prog_run(u64 *regs, const struct bpf_insn *insn, u64 run_id)
 #define CONT ({ \
 	if (unlikely(run_id > 0 && !this_cpu_read(bpf_trace_active))) { \
 		this_cpu_write(bpf_trace_active, 1); \
-		bpf_interp_hook_step(run_id, regs); \
+		interp_trace_step(this_cpu_read(bpf_trace_state), regs); \
 		this_cpu_write(bpf_trace_active, 0); \
 	} \
 	insn++; goto select_insn; \
@@ -2322,7 +2064,7 @@ static u64 ___bpf_prog_run(u64 *regs, const struct bpf_insn *insn, u64 run_id)
 #define CONT_JMP ({ \
 	if (unlikely(run_id > 0 && !this_cpu_read(bpf_trace_active))) { \
 		this_cpu_write(bpf_trace_active, 1); \
-		bpf_interp_hook_step(run_id, regs); \
+		interp_trace_step(this_cpu_read(bpf_trace_state), regs); \
 		this_cpu_write(bpf_trace_active, 0); \
 	} \
 	insn++; goto select_insn; \
@@ -2345,10 +2087,10 @@ select_insn:
 		bpf_interp_trace_drop_run(run_id,
 					  BPF_INTERP_TRACE_DROP_MAP_VALUE_ACCESS);
 		run_id = 0;
-	} else if (unlikely(run_id > 0 &&
-			    bpf_interp_trace_taint_access(insn, regs))) {
-		bpf_interp_trace_drop_helper_memory(run_id);
+	} else if (unlikely(run_id > 0 && interp_trace_external_read(insn, regs))) {
+		bpf_interp_trace_drop_run(run_id, TRACE_DROP_CTX_INTERNAL_STATE);
 		run_id = 0;
+
 	}
 	goto *jumptable[insn->code];
 
@@ -2610,25 +2352,14 @@ select_insn:
 
 	/* CALL */
 	JMP_CALL: {
-		u64 helper_output = 0;
-		size_t output_size = 0;
+		struct interp_trace_state *s = this_cpu_read(bpf_trace_state);
 
-		/* Function call scratches BPF_R1-BPF_R5 registers,
-		 * preserves BPF_R6-BPF_R9, and stores return value
-		 * into BPF_R0.
-		 */
-		if (unlikely(run_id > 0))
-			output_size = bpf_interp_trace_output(insn, regs, &helper_output);
-
+		if (unlikely(run_id && s))
+			interp_trace_helper_pre(s, insn, regs);
 		BPF_R0 = (__bpf_call_base + insn->imm)(BPF_R1, BPF_R2, BPF_R3,
 						       BPF_R4, BPF_R5);
-
-		if (unlikely(output_size &&
-			     !bpf_interp_trace_taint_add(helper_output,
-							output_size))) {
-			bpf_interp_trace_drop_helper_memory(run_id);
-			run_id = 0;
-		}
+		if (unlikely(run_id && s))
+			interp_trace_helper_post(s, BPF_R0);
 		CONT;
 	}
 
@@ -2645,27 +2376,11 @@ select_insn:
 		struct bpf_prog *prog;
 		u32 index = BPF_R3;
 
-		if (unlikely(run_id > 0 && !this_cpu_read(bpf_trace_active) && !this_cpu_read(bpf_tailcall_entered))) {
-			this_cpu_write(bpf_trace_active, 1);
-			this_cpu_write(bpf_tailcall_entered, 1);
-			/* Pass along the map pointer and index that triggered this jump. */
-			bpf_interp_hook_tailcall_map(run_id, map);
-			this_cpu_write(bpf_trace_active, 0);
-		}
-
-		/* 1. Record the attempted tail call. */
-		trace_printk("BPF_TAIL_CALL: Attempting... Map: %p, Index: %u, Current tail_call_cnt: %u\n",
-				map, index, tail_call_cnt);
-
 		if (unlikely(index >= array->map.max_entries)) {
-			trace_printk("BPF_TAIL_CALL: FAIL - Index out of bounds (%u >= %u)\n", 
-					index, array->map.max_entries);
 			goto out;
 		}
 
 		if (unlikely(tail_call_cnt >= MAX_TAIL_CALL_CNT)) {
-			trace_printk("BPF_TAIL_CALL: FAIL - Max limit reached (%u)\n", 
-					tail_call_cnt);
 			goto out;
 		}
 
@@ -2673,7 +2388,6 @@ select_insn:
 
 		prog = READ_ONCE(array->ptrs[index]);
 		if (!prog) {
-			trace_printk("BPF_TAIL_CALL: FAIL - Empty slot at index %u\n", index);
 			goto out;
 		}
 		/*
@@ -2687,16 +2401,22 @@ select_insn:
 				BPF_INTERP_TRACE_DROP_UNSUPPORTED_TAIL_TARGET);
 			run_id = 0;
 		}
-		/* 2. Record the successful jump; the current program never returns after this point. */
-		trace_printk("BPF_TAIL_CALL: SUCCESS - Jumping to new prog (ptr: %p). New cnt: %u\n",
-				prog, tail_call_cnt);
+		if (unlikely(run_id > 0)) {
+			struct interp_trace_state *s = this_cpu_read(bpf_trace_state);
+			struct bpf_trace_event e = {};
 
-		if (unlikely(run_id > 0 && !this_cpu_read(bpf_trace_active))) {
-			this_cpu_write(bpf_trace_active, 1);
-			/* Pass along the map pointer and index that triggered this jump. */
-			bpf_interp_hook_tailcall(run_id, prog, (u32)(insn - base_insn), (u64)map, index);
-			this_cpu_write(bpf_trace_active, 0);
+			e.code.from_code_id = s->code_id;
+			e.code.pc = interp_trace_pc(s, insn);
+			e.code.map_ptr = (u64)(unsigned long)map;
+			e.code.index = index;
+			e.code.max_entries = map->max_entries;
+			interp_trace_code(s, prog, 0);
+			e.code.code_id = s->code_id;
+			e.code.prog_ptr = (u64)(unsigned long)prog;
+			interp_trace_emit(s, &e, TRACE_TAILCALL);
+			this_cpu_write(bpf_trace_current_prog_ptr, prog);
 		}
+
 		/* ARG1 at this point is guaranteed to point to CTX from
 		 * the verifier side due to the fact that the tail call is
 		 * handled like a helper, that is, bpf_tail_call_proto,
@@ -2705,15 +2425,13 @@ select_insn:
 		// add state when tailcall insn success
 		if (unlikely(run_id > 0 && !this_cpu_read(bpf_trace_active))) {
 			this_cpu_write(bpf_trace_active, 1);
-			bpf_interp_hook_step(run_id, regs);
+			interp_trace_step(this_cpu_read(bpf_trace_state), regs);
 			this_cpu_write(bpf_trace_active, 0);
 		}
 		insn = prog->insnsi;
 		base_insn = insn; // <--- Critical: reset the base for the new program so its PC starts at zero.
 		goto select_insn; /* Replace the interpreter instruction pointer (insn) and re-enter the loop. */
 out:
-		/* 3. Record execution continuing after a failed tail call (fallthrough). */
-		trace_printk("BPF_TAIL_CALL: FALLTHROUGH - Continuing execution of current prog.\n");
 		CONT;
 	}
 	JMP_JA:
@@ -2939,64 +2657,61 @@ static unsigned int PROG_NAME(stack_size)(const void *ctx, const struct bpf_insn
 { \
 	u64 stack[stack_size / sizeof(u64)]; \
 	u64 regs[MAX_BPF_EXT_REG] = {}; \
-	u64 old_run_id, current_run_id = 0; \
-	const struct bpf_prog *prog_ptr; \
-	struct bpf_interp_trace_taint_state old_taint; \
-	bool old_drop, is_target = false; \
-	u64 ret; \
+	struct interp_trace_state *old_state, *state = NULL; \
+	const struct bpf_prog *prog_ptr, *old_prog; \
+	u64 old_run_id, ret; \
+	bool old_drop; \
 \
 	kmsan_unpoison_memory(stack, sizeof(stack)); \
-	FP = (u64) (unsigned long) &stack[ARRAY_SIZE(stack)]; \
-	ARG1 = (u64) (unsigned long) ctx; \
-\
-	prog_ptr = this_cpu_read(bpf_trace_current_prog_ptr); \
-\
-	/* A. Filter precisely: not recursively locked, a normal eBPF program, and running in test_progs. */ \
-	if (likely(!this_cpu_read(bpf_trace_active)) && \
-	    !this_cpu_read(bpf_trace_current_drop) && \
-	    prog_ptr && prog_ptr->aux && \
-	    bpf_interp_prog_traceable(prog_ptr) && \
-	    ((strncmp(current->comm, "test_progs", 10) == 0 && prog_ptr->aux->id > 0) || \
-	     strncmp(current->comm, "insmod", 6) == 0)) { \
-		is_target = true; \
-		current_run_id = atomic64_inc_return(&bpf_trace_run_id); \
-	} \
-\
-	/* B. Save the run_id passed to internal calls. */ \
+	FP = (u64)(unsigned long)&stack[ARRAY_SIZE(stack)]; \
+	ARG1 = (u64)(unsigned long)ctx; \
+	migrate_disable(); \
+	old_state = this_cpu_read(bpf_trace_state); \
 	old_run_id = this_cpu_read(bpf_trace_current_run_id); \
 	old_drop = this_cpu_read(bpf_trace_current_drop); \
-	this_cpu_write(bpf_trace_current_run_id, current_run_id); \
-	this_cpu_write(bpf_trace_current_drop, is_target ? false : old_drop); \
-\
-	/* C. Trigger the START hook for the target program only. */ \
-	if (unlikely(is_target)) { \
-		old_taint = *this_cpu_ptr(&bpf_trace_taint_state); \
-		memset(this_cpu_ptr(&bpf_trace_taint_state), 0, \
-		       sizeof(struct bpf_interp_trace_taint_state)); \
-		this_cpu_write(bpf_trace_active, 1); \
-		/* Pass ctx as R1 and FP as R10. */ \
-		bpf_interp_hook_start(current_run_id, prog_ptr, ARG1, FP); \
-		this_cpu_write(bpf_trace_active, 0); \
+	old_prog = this_cpu_read(bpf_trace_current_prog_ptr); \
+	prog_ptr = old_prog; \
+	if (trace_bpf_interp_enabled() && !this_cpu_read(bpf_trace_active) && \
+	    prog_ptr && prog_ptr->aux && \
+	    (!strncmp(current->comm, "test_progs", 10) || \
+	     !strncmp(current->comm, "insmod", 6))) { \
+		if (old_state) \
+			interp_trace_reason(old_state, TRACE_CALLBACK, TRACE_UNSUPPORTED); \
+		state = kzalloc(sizeof(*state), GFP_ATOMIC | __GFP_NOWARN); \
+		if (state) \
+			state->run_id = atomic64_inc_return(&bpf_trace_run_id); \
+		else { \
+			struct bpf_trace_event failed = {}; \
+			failed.hdr.run_id = atomic64_inc_return(&bpf_trace_run_id); \
+			failed.hdr.seq = 1; \
+			failed.hdr.type = TRACE_REASON; \
+			failed.diagnostic.reason = TRACE_ALLOCATION; \
+			failed.diagnostic.status = TRACE_INCOMPLETE; \
+			this_cpu_inc(bpf_trace_active); \
+			trace_bpf_interp(&failed); \
+			this_cpu_dec(bpf_trace_active); \
+		} \
 	} \
-	this_cpu_write(bpf_tailcall_entered, 0); \
-\
-	/* D. Run the main BPF program with current_run_id (>0 for the target, 0 otherwise). */ \
-	ret = ___bpf_prog_run(regs, insn, current_run_id); \
-\
-	/* E. Trigger the END hook for the target program only. */ \
-	if (unlikely(is_target && !this_cpu_read(bpf_trace_current_drop))) { \
-		this_cpu_write(bpf_trace_active, 1); \
-		bpf_interp_hook_end(current_run_id, ret); \
-		this_cpu_write(bpf_trace_active, 0); \
+	this_cpu_write(bpf_trace_state, state); \
+	this_cpu_write(bpf_trace_current_run_id, state ? state->run_id : 0); \
+	this_cpu_write(bpf_trace_current_drop, false); \
+	if (state) { \
+		interp_trace_code(state, prog_ptr, ARG1); \
+		interp_trace_frame_enter(state, FP, stack_size); \
+		if (!bpf_interp_prog_traceable(prog_ptr)) \
+			interp_trace_reason(state, TRACE_DROP_UNSUPPORTED_TAIL_TARGET, \
+					    TRACE_UNSUPPORTED); \
 	} \
-\
-	if (unlikely(is_target)) \
-		*this_cpu_ptr(&bpf_trace_taint_state) = old_taint; \
-\
-	/* F. Restore the previous run_id. */ \
+	ret = ___bpf_prog_run(regs, insn, state ? state->run_id : 0); \
+	if (state) { \
+		interp_trace_end(state, ret); \
+		kfree(state); \
+	} \
+	this_cpu_write(bpf_trace_state, old_state); \
 	this_cpu_write(bpf_trace_current_run_id, old_run_id); \
 	this_cpu_write(bpf_trace_current_drop, old_drop); \
-\
+	this_cpu_write(bpf_trace_current_prog_ptr, old_prog); \
+	migrate_enable(); \
 	return ret; \
 }
 
@@ -3006,26 +2721,29 @@ static u64 PROG_NAME_ARGS(stack_size)(u64 r1, u64 r2, u64 r3, u64 r4, u64 r5, \
 				      const struct bpf_insn *insn) \
 { \
 	u64 stack[stack_size / sizeof(u64)]; \
-	u64 regs[MAX_BPF_EXT_REG]; \
-	u64 current_run_id; \
+	u64 regs[MAX_BPF_EXT_REG] = {}; \
+	struct interp_trace_state *state = this_cpu_read(bpf_trace_state); \
+	u32 old_code = state ? state->code_id : 0; \
+	const struct bpf_prog *old_prog = this_cpu_read(bpf_trace_current_prog_ptr); \
+	u64 current_run_id = this_cpu_read(bpf_trace_current_drop) ? 0 : \
+		this_cpu_read(bpf_trace_current_run_id), ret; \
 \
 	kmsan_unpoison_memory(stack, sizeof(stack)); \
-	FP = (u64) (unsigned long) &stack[ARRAY_SIZE(stack)]; \
+	FP = (u64)(unsigned long)&stack[ARRAY_SIZE(stack)]; \
 	BPF_R1 = r1; \
 	BPF_R2 = r2; \
 	BPF_R3 = r3; \
 	BPF_R4 = r4; \
 	BPF_R5 = r5; \
-	current_run_id = this_cpu_read(bpf_trace_current_run_id); \
-\
-	/* Track internal function calls (bpf2bpf) using the main program's current_run_id. */ \
-	if (unlikely(current_run_id > 0 && !this_cpu_read(bpf_trace_active))) { \
-		this_cpu_write(bpf_trace_active, 1); \
-		bpf_interp_hook_call(current_run_id, FP); \
-		this_cpu_write(bpf_trace_active, 0); \
+	if (state && !this_cpu_read(bpf_trace_active)) \
+		interp_trace_frame_enter(state, FP, stack_size); \
+	ret = ___bpf_prog_run(regs, insn, current_run_id); \
+	if (state && !this_cpu_read(bpf_trace_active)) { \
+		interp_trace_frame_exit(state); \
+		state->code_id = old_code; \
+		this_cpu_write(bpf_trace_current_prog_ptr, old_prog); \
 	} \
-\
-	return ___bpf_prog_run(regs, insn, current_run_id); \
+	return ret; \
 }
 
 #define EVAL1(FN, X) FN(X)
