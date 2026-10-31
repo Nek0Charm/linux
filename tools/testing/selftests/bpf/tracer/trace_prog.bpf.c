@@ -1,6 +1,6 @@
+// SPDX-License-Identifier: GPL-2.0
 #include "vmlinux.h"
 #include <bpf/bpf_helpers.h>
-#include <bpf/bpf_tracing.h>
 #include "trace_common.h"
 
 struct {
@@ -8,193 +8,85 @@ struct {
 	__uint(max_entries, 32 * 1024 * 1024);
 } rb SEC(".maps");
 
-SEC("fentry/bpf_interp_hook_start")
-int BPF_PROG(on_start, u64 run_id, const struct bpf_prog *prog, u64 ctx_ptr, u64 fp)
+/* Kernel sequences count attempts before invoking this hook. A failed ring
+ * reservation or metadata read leaves a gap, checked against RUN_END even if
+ * the last STEP, POST, or chunk was lost. No per-CPU pending state or scratch.
+ */
+SEC("raw_tp/bpf_interp")
+int on_event(struct bpf_raw_tracepoint_args *ctx)
 {
-	if (!prog) return 0;
+	const struct bpf_trace_event *source = (const void *)ctx->args[0];
+	struct trace_hdr hdr;
 
-	struct evt_prog_start *evt = bpf_ringbuf_reserve(&rb, sizeof(*evt), 0);
-	if (!evt) return 0;
-
-	evt->hdr.run_id = run_id;
-	evt->hdr.type = EVT_PROG_START;
-	evt->ctx_ptr = ctx_ptr;
-	evt->sp = fp;
-	
-	/* 1. Read the prog->aux pointer safely. */
-	struct bpf_prog_aux *aux = NULL;
-	bpf_probe_read_kernel(&aux, sizeof(aux), &prog->aux);
-
-	/* 2. Read the ID and name. */
-	if (aux) {
-		bpf_probe_read_kernel(&evt->prog_id, sizeof(evt->prog_id), &aux->id);
-		/* bpf_probe_read_kernel_str handles strings and the terminating \0 automatically. */
-		bpf_probe_read_kernel_str(evt->prog_name, sizeof(evt->prog_name), aux->name);
-	} else {
-		evt->prog_id = 0;
-		evt->prog_name[0] = '\0';
-	}
-
-	/* ================= Read used_maps to build mem_blocks ================= */
-	evt->block_cnt = 0;
-	if (aux) {
-		u32 used_map_cnt = 0;
-		bpf_probe_read_kernel(&used_map_cnt, sizeof(used_map_cnt), &aux->used_map_cnt);
-		struct bpf_map **used_maps = NULL;
-		bpf_probe_read_kernel(&used_maps, sizeof(used_maps), &aux->used_maps);
-		
-		if (used_maps && used_map_cnt > 0) {
-			u32 limit = used_map_cnt > 8 ? 8 : used_map_cnt;
-			int b_idx = 0;
-			
-			for (u32 i = 0; i < 8; i++) {
-				if (i >= limit || b_idx >= MAX_MEM_BLOCKS - 1) break;
-				
-				struct bpf_map *map = NULL;
-				bpf_probe_read_kernel(&map, sizeof(map), &used_maps[i]);
-				if (!map) continue;
-
-				u32 map_type = 0;
-				bpf_probe_read_kernel(&map_type, sizeof(map_type), &map->map_type);
-				if (map_type == BPF_MAP_TYPE_PROG_ARRAY) break;
-
-				/* Block 1: map FD (cannot be dereferenced directly). */
-				evt->blocks[b_idx].base_addr = (u64)map;
-				evt->blocks[b_idx].size = 8; // here must > 0
-				evt->blocks[b_idx].is_direct_value = 0;
-				b_idx++;
-
-				/* Block 2: map value (only array maps and similar types can be dereferenced directly). */
-				if (map_type == BPF_MAP_TYPE_ARRAY) {
-					u32 v_size = 0, m_entries = 0;
-					bpf_probe_read_kernel(&v_size, sizeof(v_size), &map->value_size);
-					bpf_probe_read_kernel(&m_entries, sizeof(m_entries), &map->max_entries);
-					
-					/* Compute the value array base address using struct bpf_array from vmlinux.h. */
-					evt->blocks[b_idx].base_addr = (u64)map + __builtin_offsetof(struct bpf_array, value);
-					evt->blocks[b_idx].size = v_size * m_entries;
-					evt->blocks[b_idx].is_direct_value = 1;
-					b_idx++;
-				}
-			}
-			evt->block_cnt = b_idx;
-		}
-	}
-	/* ======================================================================== */
-
-	/* 3. Read the instruction count from prog->len. */
-	bpf_probe_read_kernel(&evt->insn_cnt, sizeof(evt->insn_cnt), &prog->len);
-
-	/* 4. Read the original unmodified bytecode (prog->insnsi is the flexible array base). */
-	u32 cnt = evt->insn_cnt;
-	if (cnt > MAX_INSN_DUMP) {
-		cnt = MAX_INSN_DUMP;
-	}
-	bpf_probe_read_kernel(evt->insns, cnt * sizeof(struct bpf_insn), prog->insnsi);
-
-	bpf_ringbuf_submit(evt, 0);
-	return 0;
-}
-
-SEC("fentry/bpf_interp_hook_step")
-int BPF_PROG(on_step, u64 run_id, const u64 *regs)
-{
-	struct evt_trace_step *evt = bpf_ringbuf_reserve(&rb, sizeof(*evt), 0);
-	if (!evt) return 0;
-
-	evt->hdr.run_id = run_id;
-	evt->hdr.type = EVT_TRACE_STEP;
-	bpf_probe_read_kernel(evt->regs, sizeof(evt->regs), regs);
-	
-	bpf_ringbuf_submit(evt, 0);
-	return 0;
-}
-
-SEC("fentry/bpf_interp_hook_end")
-int BPF_PROG(on_end, u64 run_id, u64 ret)
-{
-	struct evt_prog_end *evt = bpf_ringbuf_reserve(&rb, sizeof(*evt), 0);
-	if (!evt) return 0;
-
-	evt->hdr.run_id = run_id;
-	evt->hdr.type = EVT_PROG_END;
-	evt->ret_val = ret;
-	
-	bpf_ringbuf_submit(evt, 0);
-	return 0;
-}
-
-SEC("fentry/bpf_interp_hook_call")
-int BPF_PROG(on_call, u64 run_id, u64 fp)
-{
-	struct evt_prog_call *evt = bpf_ringbuf_reserve(&rb, sizeof(*evt), 0);
-	if (!evt) return 0;
-
-	evt->hdr.run_id = run_id;
-	evt->hdr.type = EVT_PROG_CALL;
-	evt->sp = fp;
-	
-	bpf_ringbuf_submit(evt, 0);
-	return 0;
-}
-
-SEC("fentry/bpf_interp_hook_tailcall")
-int BPF_PROG(on_tailcall, u64 run_id, const struct bpf_prog *prog, u32 pc, u64 map_ptr, u32 index)
-{
-	if (!prog) return 0;
-	
-	struct evt_prog_tailcall *evt = bpf_ringbuf_reserve(&rb, sizeof(*evt), 0);
-	if (!evt) return 0;
-
-	evt->hdr.run_id = run_id;
-	evt->hdr.type = EVT_PROG_TAILCALL;
-	evt->pc = pc;
-	evt->map_ptr = map_ptr;
-	evt->index = index;
-	evt->prog_ptr = (u64)prog;
-	
-	/* Extract the instruction sequence. */
-	bpf_probe_read_kernel(&evt->insn_cnt, sizeof(evt->insn_cnt), &prog->len);
-	__u32 copy_cnt = evt->insn_cnt;
-	if (copy_cnt > MAX_INSN_DUMP) copy_cnt = MAX_INSN_DUMP;
-	
-	if (copy_cnt > 0) {
-		bpf_probe_read_kernel(evt->insns, copy_cnt * sizeof(struct bpf_insn), prog->insnsi);
-	}
-
-	bpf_ringbuf_submit(evt, 0);
-	return 0;
-}
-
-SEC("fentry/bpf_interp_hook_tailcall_map")
-int BPF_PROG(on_tailcall_map, u64 run_id, const struct bpf_map * map_ptr)
-{	
-	struct evt_prog_tailcall_map *evt = bpf_ringbuf_reserve(&rb, sizeof(*evt), 0);
-	if (!evt) return 0;
-
-	evt->hdr.run_id = run_id;
-	evt->hdr.type = EVT_PROG_TAILCALL_MAP;
-	evt->map_ptr = (u64)map_ptr;
-	evt->max_entries = map_ptr->max_entries;
-
-	bpf_ringbuf_submit(evt, 0);
-	return 0;
-}
-
-SEC("fentry/bpf_interp_hook_drop")
-int BPF_PROG(on_drop, u64 run_id, u32 reason)
-{
-	struct evt_prog_drop *evt;
-
-	evt = bpf_ringbuf_reserve(&rb, sizeof(*evt), 0);
-	if (!evt)
+	if (bpf_probe_read_kernel(&hdr, sizeof(hdr), &source->hdr))
 		return 0;
+	if (hdr.type == TRACE_START || hdr.type == TRACE_CODE) {
+		struct evt_code *out = bpf_ringbuf_reserve(&rb, sizeof(*out), 0);
+		const struct bpf_prog *prog;
+		struct bpf_prog_aux *aux = NULL;
+		struct bpf_interp_helper_call *calls = NULL;
+		u32 count = 0;
+		int err;
 
-	evt->hdr.run_id = run_id;
-	evt->hdr.type = EVT_PROG_DROP;
-	evt->reason = reason;
+		if (!out)
+			return 0;
+		out->prog_id = 0;
+		out->insn_cnt = 0;
+		out->helper_call_cnt = 0;
+		__builtin_memset(out->prog_name, 0, sizeof(out->prog_name));
+		err = bpf_probe_read_kernel(&out->event, sizeof(out->event), source);
+		prog = (const void *)out->event.code.prog_ptr;
+		err |= bpf_probe_read_kernel(&out->insn_cnt, sizeof(out->insn_cnt), &prog->len);
+		err |= bpf_probe_read_kernel(&aux, sizeof(aux), &prog->aux);
+		if (aux) {
+			err |= bpf_probe_read_kernel(&out->prog_id, sizeof(out->prog_id), &aux->id);
+			err |= bpf_probe_read_kernel(out->prog_name, sizeof(out->prog_name), aux->name);
+			err |= bpf_probe_read_kernel(&count, sizeof(count), &aux->interp_helper_call_cnt);
+			err |= bpf_probe_read_kernel(&calls, sizeof(calls), &aux->interp_helper_calls);
+		}
+		if (out->insn_cnt > TRACE_MAX_INSNS || count > TRACE_MAX_INSNS) {
+			err = -7;
+		} else {
+			u32 len = out->insn_cnt;
 
-	bpf_ringbuf_submit(evt, 0);
+			if (len && len <= TRACE_MAX_INSNS)
+				err |= bpf_probe_read_kernel(out->insns, len * sizeof(struct bpf_insn), prog->insnsi);
+			if (count && count <= TRACE_MAX_INSNS)
+				err |= bpf_probe_read_kernel(out->helper_calls, count * sizeof(*calls), calls);
+			out->helper_call_cnt = count;
+		}
+		out->event.hdr = hdr;
+		out->event.hdr.read_error = err;
+		bpf_ringbuf_submit(out, 0);
+	} else if (hdr.type == TRACE_MEMORY) {
+		struct evt_memory *out = bpf_ringbuf_reserve(&rb, sizeof(*out), 0);
+		u32 len;
+		int err;
+
+		if (!out)
+			return 0;
+		__builtin_memset(out, 0, sizeof(*out));
+		err = bpf_probe_read_kernel(&out->event, sizeof(out->event), source);
+		len = out->event.memory.valid_length;
+		if (!err && len && len <= TRACE_CHUNK_SIZE)
+			err = bpf_probe_read_kernel(out->bytes, len,
+				(const void *)(out->event.memory.address + out->event.memory.chunk_offset));
+		else if (len > TRACE_CHUNK_SIZE)
+			err = -7;
+		out->event.hdr = hdr;
+		out->event.hdr.read_error = err;
+		bpf_ringbuf_submit(out, 0);
+	} else {
+		struct bpf_trace_event *out = bpf_ringbuf_reserve(&rb, sizeof(*out), 0);
+
+		if (!out)
+			return 0;
+		if (bpf_probe_read_kernel(out, sizeof(*out), source)) {
+			bpf_ringbuf_discard(out, 0);
+			return 0;
+		}
+		bpf_ringbuf_submit(out, 0);
+	}
 	return 0;
 }
 

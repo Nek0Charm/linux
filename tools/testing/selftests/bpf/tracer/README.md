@@ -65,6 +65,23 @@ tools/testing/selftests/bpf/vmtest.sh \
   -- ./tracer/guest_run.sh smoke
 ```
 
+## JSON reader compatibility
+
+The sequenced event format keeps the legacy validator's mandatory fields:
+`sp_list` lists frame pointers in frame-entry order (including reused stack
+addresses), and `jmp_map_ptr` and `jmp_max_entries` describe the first
+successful tail call's map. Programs without a successful tail call use zero.
+Each `jmp_table` entry includes its target's `insns` as well as its `code_id`.
+The `codes`, region lifetimes, helper events, and memory snapshots remain
+available to readers of the extended format.
+
+These fields preserve the existing OCaml reader's input shape. A complete
+capture does not imply that the legacy replay semantics supports every
+captured feature: replaying helper memory effects and initial map contents
+requires a validator that consumes the extended fields. The legacy jump-table
+model also represents only one program-array map. Parse compatibility is
+checked by `make check`; semantic replay must be tested separately.
+
 ## Overview
 
 This project is composed of kernel part and user part.

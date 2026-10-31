@@ -42,7 +42,7 @@ BPF_CFLAGS := -g -O2 \
 # Libraries
 LIBS := $(LIBBPF_A) -lelf -lz
 
-.PHONY: all clean
+.PHONY: all clean test check
 
 all: $(APP)
 
@@ -52,7 +52,7 @@ vmlinux.h: $(VMLINUX_BTF)
 	$(BPFTOOL) btf dump file $(VMLINUX_BTF) format c > vmlinux.h
 
 # Step 2: Compile the eBPF C code into BPF bytecode (an .o file)
-$(BPF_OBJ): $(BPF_C) vmlinux.h trace_common.h
+$(BPF_OBJ): $(BPF_C) vmlinux.h trace_common.h ../../../../../include/linux/bpf_interp_trace.h
 	@echo "  CLANG    $@"
 	$(CLANG) $(BPF_CFLAGS) -c $(BPF_C) -o $@
 
@@ -62,10 +62,14 @@ $(SKEL_H): $(BPF_OBJ)
 	$(BPFTOOL) gen skeleton $(BPF_OBJ) > $@
 
 # Step 4: Compile the final user-space C program
-$(APP): $(USER_C) $(SKEL_H) trace_common.h
+$(APP): $(USER_C) trace_consumer.c trace_consumer.h $(SKEL_H) trace_common.h ../../../../../include/linux/bpf_interp_trace.h
 	@echo "  CC       $@"
-	$(CC) $(CFLAGS) $(USER_C) -o $(APP) $(LIBS)
+	$(CC) $(CFLAGS) $(USER_C) trace_consumer.c -o $(APP) $(LIBS)
 
 clean:
 	@echo "  CLEAN"
 	rm -f $(APP) $(BPF_OBJ) $(SKEL_H) vmlinux.h
+
+# Check JSON reader compatibility without libbpf, BTF, or root privileges.
+test check:
+	@CC="$(CC)" CFLAGS="$(CFLAGS) -Wextra -Werror" bash ./trace_compat_test.sh
