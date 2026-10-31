@@ -34,7 +34,7 @@ Build the kernel and tracer, boot the vmtest VM, run the selected tracing
 experiment, and write JSON files to a host directory.
 
 Options:
-  --suite <smoke|test_progs|test_bpf|all>
+  --suite <smoke|helper-memory|test_progs|test_bpf|all>
                               Experiment suite (default: smoke)
   --test <name>               test_progs test name; may be repeated
   --output <directory>        Result directory
@@ -95,7 +95,7 @@ while (($#)); do
 done
 
 case "${SUITE}" in
-smoke|test_progs|test_bpf|all) ;;
+smoke|helper-memory|test_progs|test_bpf|all) ;;
 *)
 	echo "Unknown suite: ${SUITE}" >&2
 	exit 2
