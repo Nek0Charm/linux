@@ -21,7 +21,7 @@
 #define REASON_OUTPUT 109
 #define REASON_LIMIT 110
 #define REASON_MAX 128
-#define MAX_CALL_SNAPSHOTS 4
+#define MAX_CALL_SNAPSHOTS 6
 
 typedef unsigned long long ull;
 
@@ -33,13 +33,13 @@ struct region_record {
 struct snapshot_record {
 	struct trace_memory info;
 	__u32 received, chunks;
+	__u64 first_seq, last_seq;
 	int error;
 	unsigned char bytes[TRACE_CALL_BYTES];
 };
 
 struct pending_call {
 	struct trace_helper pre, post;
-	__u64 pre_seq, post_seq;
 	bool active, posted;
 	__u32 count;
 	struct snapshot_record snapshots[MAX_CALL_SNAPSHOTS];
@@ -50,11 +50,15 @@ struct active_run {
 	bool started, ended;
 	int status;
 	bool reasons[REASON_MAX];
-	FILE *trace, *helpers, *tails;
+	FILE *trace, *helpers, *tails, *initial;
 	struct evt_code *codes[TRACE_MAX_CODES];
 	__u32 code_count, region_count, tail_count, helper_count;
 	struct region_record regions[TRACE_MAX_REGIONS];
-	struct pending_call pending;
+	struct pending_call pending, initializing;
+	struct trace_map maps[TRACE_MAX_MAPS];
+	__u64 map_born[TRACE_MAX_MAPS];
+	__u32 map_count, initial_count;
+	__u32 initial_ids[TRACE_MAX_REGIONS];
 	struct trace_summary summary;
 	struct active_run *next;
 };
@@ -83,6 +87,9 @@ static const char *reason_name(unsigned int reason)
 	case TRACE_UNKNOWN_REGION: return "unsupported_region";
 	case TRACE_CODE_IDENTITY: return "code_identity";
 	case TRACE_CALLBACK: return "helper_callback";
+	case TRACE_UNSUPPORTED_MAP: return "unsupported_map";
+	case TRACE_UNSUPPORTED_ALIAS: return "unsupported_alias";
+	case TRACE_UNSUPPORTED_CONCURRENCY: return "unsupported_concurrency";
 	case TRACE_ALLOCATION: return "allocation";
 	case REASON_SEQUENCE: return "event_sequence";
 	case REASON_START: return "missing_or_duplicate_start";
@@ -140,13 +147,16 @@ static struct active_run *get_run(__u64 id)
 	r->trace = tmpfile();
 	r->helpers = tmpfile();
 	r->tails = tmpfile();
-	if (!r->trace || !r->helpers || !r->tails) {
+	r->initial = tmpfile();
+	if (!r->trace || !r->helpers || !r->tails || !r->initial) {
 		if (r->trace)
 			fclose(r->trace);
 		if (r->helpers)
 			fclose(r->helpers);
 		if (r->tails)
 			fclose(r->tails);
+		if (r->initial)
+			fclose(r->initial);
 		free(r);
 		output_error = errno ? errno : EIO;
 		return NULL;
@@ -216,7 +226,8 @@ static void write_snapshots(FILE *fp, struct pending_call *p, unsigned int phase
 {
 	bool first = true;
 
-	fprintf(fp, "[");
+	if (phase != TRACE_INITIAL_MEMORY)
+		fprintf(fp, "[");
 	for (__u32 i = 0; i < p->count; i++) {
 		struct snapshot_record *s = &p->snapshots[i];
 
@@ -229,11 +240,14 @@ static void write_snapshots(FILE *fp, struct pending_call *p, unsigned int phase
 			first ? "" : ",", s->info.region_id, (ull)s->info.offset, s->info.length);
 		first = false;
 		fprintf(fp, "            \"snapshot_id\": %u,\n"
-			"            \"chunks\": %u,\n"
 			"            \"read_status\": \"%s\"",
-			s->info.snapshot_id, s->chunks,
+			s->info.snapshot_id,
 			s->received != s->info.length ? "missing" :
 			s->error ? (s->info.expected_fault ? "fault" : "error") : "ok");
+		fprintf(fp, ",\n            \"first_seq\": %llu, \"last_seq\": %llu",
+			(ull)s->first_seq, (ull)s->last_seq);
+		if (phase == TRACE_INITIAL_MEMORY)
+			fprintf(fp, ",\n            \"code_id\": %u", s->info.code_id);
 		if (s->error)
 			fprintf(fp, ",\n            \"error\": %d", s->error);
 		if (!s->error && s->received == s->info.length) {
@@ -246,7 +260,90 @@ static void write_snapshots(FILE *fp, struct pending_call *p, unsigned int phase
 	}
 	if (!first)
 		fprintf(fp, "\n        ");
-	fprintf(fp, "]");
+	if (phase != TRACE_INITIAL_MEMORY)
+		fprintf(fp, "]");
+}
+
+static void write_map_effect(FILE *fp, struct pending_call *p)
+{
+	struct trace_map_effect *pre = &p->pre.map_effect, *post = &p->post.map_effect;
+
+	if (!pre->map_id)
+		return;
+	fprintf(fp, ", \"map_effect\": {\"map_id\": %u, \"key_snapshot_id\": %u, \"input_value_snapshot_id\": ",
+		pre->map_id, pre->key_snapshot_id);
+	if (pre->input_value_snapshot_id)
+		fprintf(fp, "%u", pre->input_value_snapshot_id);
+	else
+		fprintf(fp, "null");
+	for (int i = 0; i < 2; i++) {
+		struct trace_map_effect *e = i ? post : pre;
+
+		fprintf(fp, ", \"%s\": {\"state\": \"%s\"", i ? "after" : "before",
+			e->state == 1 ? "present" : e->state == 2 ? "absent" : "unknown");
+		if (e->state == 1)
+			fprintf(fp, ", \"entry_id\": %u, \"value_snapshot_id\": %u", e->entry_id, e->value_snapshot_id);
+		if (!e->state)
+			fprintf(fp, ", \"reason\": \"observation_unavailable\"");
+		fprintf(fp, "}");
+	}
+	fprintf(fp, ", \"return_ref\": ");
+	if (post->return_region_id)
+		fprintf(fp, "{\"region_id\": %u, \"offset\": 0}", post->return_region_id);
+	else
+		fprintf(fp, "null");
+	fprintf(fp, "}");
+}
+
+static bool map_call_valid(struct active_run *r, struct pending_call *p)
+{
+	struct trace_map_effect *a = &p->pre.map_effect, *b = &p->post.map_effect;
+	struct trace_map *m;
+	struct snapshot_record *key, *value;
+	__u32 index, count, target = 0;
+
+	if (p->pre.helper_id < 1 || p->pre.helper_id > 3)
+		return !a->map_id;
+	if (!a->map_id || a->map_id > r->map_count || a->map_id != b->map_id || !p->count)
+		return false;
+	m = &r->maps[a->map_id - 1];
+	key = &p->snapshots[0];
+	if (m->map_type != BPF_MAP_TYPE_ARRAY || !m->supported ||
+	    m->address != p->pre.args[0] || key->info.length != 4 ||
+	    key->info.snapshot_id != a->key_snapshot_id || key->error || key->received != 4)
+		return false;
+	memcpy(&index, key->bytes, 4);
+	count = (p->pre.helper_id == 2 ? 2 : 1) + (index < m->max_entries);
+	if (p->count != 2 * count || p->pre.snapshots != count || p->post.snapshots != count ||
+	    a->state != (index < m->max_entries ? 1U : 2U) || a->state != b->state)
+		return false;
+	for (__u32 i = 0; i < count; i++) {
+		struct trace_memory *x = &p->snapshots[i].info, *y = &p->snapshots[count + i].info;
+
+		if (x->phase || y->phase != 1 || x->region_id != y->region_id ||
+		    x->offset != y->offset || x->length != y->length)
+			return false;
+	}
+	if (key->info.address != p->pre.args[1] ||
+	    (p->pre.helper_id == 2 && (p->snapshots[1].info.snapshot_id != a->input_value_snapshot_id ||
+	     p->snapshots[1].info.address != p->pre.args[2] || p->snapshots[1].info.length != m->value_size)))
+		return false;
+	if (index < m->max_entries) {
+		value = &p->snapshots[count - 1];
+		target = value->info.region_id;
+		if (!target || target > r->region_count || !r->initial_ids[target - 1] ||
+		    r->regions[target - 1].info.map_id != a->map_id ||
+		    r->regions[target - 1].info.element_index != index ||
+		    a->entry_id != r->regions[target - 1].info.entry_id || a->entry_id != b->entry_id ||
+		    value->info.offset || value->info.length != m->value_size ||
+		    value->info.snapshot_id != a->value_snapshot_id ||
+		    p->snapshots[p->count - 1].info.snapshot_id != b->value_snapshot_id)
+			return false;
+	}
+	if (p->pre.helper_id == 1 && p->post.ret)
+		return target && b->return_region_id == target &&
+			p->post.ret == r->regions[target - 1].info.base_addr;
+	return !b->return_region_id;
 }
 
 static void finish_call(struct active_run *r, const struct bpf_trace_event *step)
@@ -261,6 +358,10 @@ static void finish_call(struct active_run *r, const struct bpf_trace_event *step
 	if (!p->posted || !step || p->post.trace_index != step->step.index ||
 	    p->post.ret != step->step.regs[0]) {
 		fail(r, REASON_PAIR, TRACE_INCOMPLETE);
+		status = TRACE_INCOMPLETE;
+	}
+	if (status == TRACE_COMPLETE && !map_call_valid(r, p)) {
+		fail(r, REASON_REFERENCE, TRACE_INCOMPLETE);
 		status = TRACE_INCOMPLETE;
 	}
 	for (__u32 i = 0; i < p->count; i++) {
@@ -283,11 +384,9 @@ static void finish_call(struct active_run *r, const struct bpf_trace_event *step
 		"        \"pc\": %u,\n",
 		r->helper_count++ ? ",\n" : "", p->pre.call_id, p->pre.code_id, p->pre.pc);
 	fprintf(fp, "        \"trace_index\": %llu,\n"
-		"        \"pre_seq\": %llu,\n"
-		"        \"post_seq\": %llu,\n"
 		"        \"helper_id\": %u,\n"
 		"        \"args\": [",
-		(ull)p->pre.trace_index, (ull)p->pre_seq, (ull)p->post_seq, p->pre.helper_id);
+		(ull)p->pre.trace_index, p->pre.helper_id);
 	for (unsigned int i = 0; i < 5; i++)
 		fprintf(fp, "%s\"0x%llx\"", i ? ", " : "", (ull)p->pre.args[i]);
 	fprintf(fp, "],\n        \"ret\": \"0x%llx\",\n        \"premem\": ",
@@ -295,6 +394,7 @@ static void finish_call(struct active_run *r, const struct bpf_trace_event *step
 	write_snapshots(fp, p, 0);
 	fprintf(fp, ",\n        \"postmem\": ");
 	write_snapshots(fp, p, 1);
+	write_map_effect(fp, p);
 	fprintf(fp, ",\n        \"capture_status\": \"%s\"\n      }", status_name(status));
 	memset(p, 0, sizeof(*p));
 }
@@ -302,11 +402,14 @@ static void finish_call(struct active_run *r, const struct bpf_trace_event *step
 static void receive_memory(struct active_run *r, const struct evt_memory *evt)
 {
 	const struct trace_memory *m = &evt->event.memory;
-	struct pending_call *p = &r->pending;
+	struct pending_call *p = m->phase == TRACE_INITIAL_MEMORY ? &r->initializing : &r->pending;
 	struct snapshot_record *s = NULL;
+	bool initial = m->phase == TRACE_INITIAL_MEMORY;
 
-	if (!p->active || m->call_id != p->pre.call_id || m->phase > 1 ||
-	    m->phase != (unsigned int)p->posted || m->length > TRACE_CALL_BYTES ||
+	if ((!initial && (!p->active || m->call_id != p->pre.call_id ||
+	     m->phase != (unsigned int)p->posted)) || m->phase > TRACE_INITIAL_MEMORY ||
+	    (initial && (m->call_id || !m->map_id || m->map_id > r->map_count ||
+	     r->pending.active || m->code_id != r->maps[m->map_id - 1].code_id)) || m->length > TRACE_CALL_BYTES ||
 	    m->valid_length > TRACE_CHUNK_SIZE || m->chunk_offset > m->length ||
 	    m->valid_length != (m->length - m->chunk_offset > TRACE_CHUNK_SIZE ?
 		TRACE_CHUNK_SIZE : m->length - m->chunk_offset) ||
@@ -333,8 +436,11 @@ static void receive_memory(struct active_run *r, const struct evt_memory *evt)
 			fail(r, REASON_CHUNK, TRACE_INCOMPLETE);
 		s = &p->snapshots[p->count++];
 		s->info = *m;
+		s->first_seq = evt->event.hdr.seq;
 		r->snapshots++;
 		r->bytes += m->length;
+		if (r->bytes > TRACE_RUN_BYTES || r->snapshots > TRACE_MAX_SNAPSHOTS)
+			fail(r, REASON_LIMIT, TRACE_INCOMPLETE);
 	}
 	if (s->received != m->chunk_offset || s->chunks != m->chunk_index ||
 	    s->info.region_id != m->region_id || s->info.offset != m->offset ||
@@ -353,6 +459,18 @@ static void receive_memory(struct active_run *r, const struct evt_memory *evt)
 	}
 	s->received += m->valid_length;
 	s->chunks++;
+	s->last_seq = evt->event.hdr.seq;
+	if (initial && s->received == m->length) {
+		struct trace_region *b = &r->regions[m->region_id - 1].info;
+
+		if (b->type != TRACE_MAP_VALUE || b->map_id != m->map_id || m->offset ||
+		    m->length != b->size || r->initial_ids[m->region_id - 1])
+			fail(r, REASON_REFERENCE, TRACE_INCOMPLETE);
+		r->initial_ids[m->region_id - 1] = m->snapshot_id;
+		fprintf(r->initial, "%s", r->initial_count++ ? "," : "");
+		write_snapshots(r->initial, p, TRACE_INITIAL_MEMORY);
+		memset(p, 0, sizeof(*p));
+	}
 }
 
 static void receive_region(struct active_run *r, const struct bpf_trace_event *e)
@@ -450,13 +568,76 @@ static const char *region_name(__u32 type)
 	return names[type <= TRACE_KERNEL_SOURCE ? type : 0];
 }
 
+/* Manifest is written by the synchronous fixture after releasing all object
+ * references. Program ID and monotonic execution window bind each declaration.
+ * Lines: prog_id kernel_map_id start_ns end_ns cleaned role
+ */
+static bool fixture_map(struct active_run *r, struct trace_map *m)
+{
+	const char *path = getenv("TRACE_FIXTURE_FILE");
+	FILE *manifest = path ? fopen(path, "r") : NULL;
+	unsigned int prog, map, cleaned;
+	ull start, end;
+	char role[32];
+	bool found = false;
+
+	if (manifest) {
+		while (fscanf(manifest, "%u %u %llu %llu %u %31s", &prog, &map, &start, &end, &cleaned, role) == 6)
+			if (r->codes[0] && prog == r->codes[0]->prog_id && map == m->kernel_map_id &&
+			    start && start <= r->codes[0]->event.code.time_ns &&
+			    end >= r->summary.time_ns && end > start && cleaned == 1 &&
+			    !strcmp(role, m->map_type == BPF_MAP_TYPE_PROG_ARRAY ? "tail_call" : "ordinary_array")) {
+				found = true;
+				break;
+			}
+		fclose(manifest);
+	}
+	return found;
+}
+
+static void write_maps(struct active_run *r)
+{
+	fprintf(output, ",\n    \"maps\": [");
+	for (__u32 i = 0; i < r->map_count; i++) {
+		struct trace_map *m = &r->maps[i];
+		bool first = true;
+
+		fprintf(output, "%s{\"map_id\": %u, \"map_region_id\": %u, \"map_type\": %u, \"key_size\": %u, \"value_size\": %u, \"max_entries\": %u, \"map_flags\": %u, \"value_stride\": %u, \"born_seq\": %llu, \"dead_seq\": %llu, \"initial_state\": {\"code_id\": %u, \"status\": \"%s\", \"entries\": [",
+			i ? "," : "", m->map_id, m->map_region_id, m->map_type,
+			m->key_size, m->value_size, m->max_entries, m->map_flags, m->value_stride,
+			(ull)r->map_born[i], (ull)r->seq, m->code_id, m->supported ? "complete" : "unsupported");
+		for (__u32 j = 0; j < r->region_count; j++) {
+			struct trace_region *b = &r->regions[j].info;
+
+			if (b->type != TRACE_MAP_VALUE || b->map_id != m->map_id)
+				continue;
+			fprintf(output, "%s{\"region_id\": %u, \"snapshot_id\": %u}",
+				first ? "" : ",", b->region_id, r->initial_ids[j]);
+			first = false;
+		}
+		fprintf(output, "]}}");
+	}
+	fprintf(output, "],\n    \"initial_memory\": [");
+	copy_stream(output, r->initial);
+	fprintf(output, "]");
+}
+
 static void finish_run(struct active_run *r)
 {
 	struct active_run **link;
 	struct evt_code *main = r->codes[0];
-	bool first = true;
+	bool first = true, exclusive = true;
 
 	finish_call(r, NULL);
+	for (__u32 i = 0; i < r->region_count; i++)
+		if (r->regions[i].info.type == TRACE_MAP_VALUE && !r->initial_ids[i])
+			fail(r, REASON_REFERENCE, TRACE_INCOMPLETE);
+	for (__u32 i = 0; i < r->map_count; i++)
+		if (r->maps[i].map_type != BPF_MAP_TYPE_PROG_ARRAY &&
+		    !fixture_map(r, &r->maps[i])) {
+			exclusive = false;
+			fail(r, TRACE_UNSUPPORTED_CONCURRENCY, TRACE_UNSUPPORTED);
+		}
 	if (!r->started)
 		fail(r, REASON_START, TRACE_INCOMPLETE);
 	if (!r->ended)
@@ -533,15 +714,20 @@ static void finish_run(struct active_run *r)
 			"        \"born_seq\": %llu,\n"
 			"        \"dead_seq\": ",
 			region_name(b->info.type),
-			b->info.type == TRACE_MAP_FD || b->info.type == TRACE_KERNEL_SOURCE ? "none" : "rw",
+			b->info.type == TRACE_MAP_FD || b->info.type == TRACE_KERNEL_SOURCE ? "none" :
+			b->info.type != TRACE_MAP_VALUE ? "rw" :
+			b->info.permissions == 3 ? "rw" : b->info.permissions == 1 ? "r" :
+			b->info.permissions == 2 ? "w" : "none",
 			(ull)b->born);
 		if (b->dead)
 			fprintf(output, "%llu", (ull)b->dead);
 		else
 			fprintf(output, "null");
+		if (b->info.type == TRACE_MAP_VALUE)
+			fprintf(output, ",\n        \"map_id\": %u, \"element_index\": %u, \"entry_id\": %u",
+				b->info.map_id, b->info.element_index, b->info.entry_id);
 		if (b->info.type == TRACE_STACK) {
-			fprintf(output, ",\n        \"frame_id\": %u,\n"
-				"        \"parent_frame_id\": ", b->info.frame_id);
+			fprintf(output, ",\n        \"parent_region_id\": ");
 			if (b->info.parent_frame_id)
 				fprintf(output, "%u", b->info.parent_frame_id);
 			else
@@ -551,31 +737,14 @@ static void finish_run(struct active_run *r)
 	}
 	if (r->region_count)
 		fprintf(output, "\n    ");
-	fprintf(output, "],\n    \"capture_config\": {\n"
-		"      \"chunk_size\": %u,\n"
-		"      \"call_bytes\": %u,\n"
-		"      \"run_bytes\": %u,\n"
-		"      \"max_calls\": %u,\n"
-		"      \"max_regions\": %u,\n"
-		"      \"max_snapshots\": %u\n    },\n",
-		TRACE_CHUNK_SIZE, TRACE_CALL_BYTES, TRACE_RUN_BYTES,
-		TRACE_MAX_CALLS, TRACE_MAX_REGIONS, TRACE_MAX_SNAPSHOTS);
-	fprintf(output, "    \"capture_summary\": {\n"
-		"      \"events\": %llu,\n"
-		"      \"steps\": %llu,\n"
-		"      \"calls\": %llu,\n"
-		"      \"regions\": %u,\n"
-		"      \"snapshots\": %u,\n"
-		"      \"snapshot_bytes\": %llu,\n"
-		"      \"ret\": \"0x%llx\",\n"
-		"      \"received_events\": %llu,\n"
-		"      \"last_seq\": %llu,\n"
-		"      \"has_start\": %s,\n"
-		"      \"has_end\": %s\n    },\n",
-		(ull)r->summary.events, (ull)r->summary.steps, (ull)r->summary.calls,
-		r->summary.regions, r->summary.snapshots, (ull)r->summary.snapshot_bytes,
-		(ull)r->summary.ret, (ull)r->events, (ull)r->seq,
-		r->started ? "true" : "false", r->ended ? "true" : "false");
+	fprintf(output, "]");
+	write_maps(r);
+	fprintf(output, ",\n    \"execution_assumption\": \"%s\",\n",
+		exclusive && r->map_count ? "exclusive_fixture" : "unverified");
+	if (r->ended)
+		fprintf(output, "    \"ret\": \"0x%llx\",\n", (ull)r->summary.ret);
+	else
+		fprintf(output, "    \"ret\": null,\n");
 	fprintf(output, "    \"capture_status\": \"%s\",\n    \"capture_reasons\": [",
 		status_name(r->status));
 	for (unsigned int i = 0; i < REASON_MAX; i++) {
@@ -596,6 +765,7 @@ static void finish_run(struct active_run *r)
 	fclose(r->trace);
 	fclose(r->helpers);
 	fclose(r->tails);
+	fclose(r->initial);
 	free(r);
 }
 
@@ -637,6 +807,23 @@ int trace_consumer_event(void *ctx, void *data, size_t size)
 	case TRACE_CODE:
 		receive_code(r, data);
 		break;
+	case TRACE_MAP:
+		if (!e->map.map_id || e->map.map_id != r->map_count + 1 ||
+		    r->map_count == TRACE_MAX_MAPS || !e->map.map_region_id ||
+		    e->map.map_region_id > r->region_count || e->map.code_id >= r->code_count ||
+		    !e->map.kernel_map_id || e->map.supported > 1 ||
+		    (e->map.supported && (e->map.map_type != BPF_MAP_TYPE_ARRAY ||
+		     e->map.key_size != 4 || !e->map.value_size || !e->map.max_entries ||
+		     e->map.value_size > e->map.value_stride)) ||
+		    r->regions[e->map.map_region_id - 1].info.type != TRACE_MAP_FD ||
+		    r->regions[e->map.map_region_id - 1].info.size ||
+		    r->regions[e->map.map_region_id - 1].info.base_addr != e->map.address) {
+			fail(r, REASON_REFERENCE, TRACE_INCOMPLETE);
+			break;
+		}
+		r->map_born[r->map_count] = e->hdr.seq;
+		r->maps[r->map_count++] = e->map;
+		break;
 	case TRACE_REGION:
 	case TRACE_REGION_END:
 		receive_region(r, e);
@@ -651,7 +838,6 @@ int trace_consumer_event(void *ctx, void *data, size_t size)
 			fail(r, TRACE_UNKNOWN_HELPER, TRACE_UNSUPPORTED);
 		r->pending.active = true;
 		r->pending.pre = e->helper;
-		r->pending.pre_seq = e->hdr.seq;
 		break;
 	case TRACE_HELPER_POST:
 		if (!r->pending.active || r->pending.posted ||
@@ -664,7 +850,6 @@ int trace_consumer_event(void *ctx, void *data, size_t size)
 			fail(r, REASON_PAIR, TRACE_INCOMPLETE);
 		r->pending.posted = true;
 		r->pending.post = e->helper;
-		r->pending.post_seq = e->hdr.seq;
 		break;
 	case TRACE_MEMORY:
 		receive_memory(r, data);
@@ -710,7 +895,8 @@ int trace_consumer_event(void *ctx, void *data, size_t size)
 		for (__u32 i = 0; i < r->region_count; i++)
 			if (!r->regions[i].dead)
 				fail(r, REASON_REFERENCE, TRACE_INCOMPLETE);
-		finish_run(r);
+		if (!r->map_count)
+			finish_run(r);
 		break;
 	default:
 		fail(r, REASON_EVENT, TRACE_INCOMPLETE);
