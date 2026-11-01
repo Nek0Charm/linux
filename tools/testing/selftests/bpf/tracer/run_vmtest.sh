@@ -167,48 +167,34 @@ echo "Suite:       ${SUITE}"
 VALID_JSON_COUNT=0
 EMPTY_JSON_COUNT=0
 INVALID_JSON_COUNT=0
+UNSUPPORTED_JSON_COUNT=0
 
-classify_json_results()
+check_json_results()
 {
-	local experiment_dir error_dir empty_dir file relative_path
-	local validation_file="${RESULTS_DIR}/json-validation.tsv"
+	local file state
 
-	printf 'status\tfile\n' > "${validation_file}"
-
-	for experiment_dir in \
-		"${RESULTS_DIR}/test_progs" \
-		"${RESULTS_DIR}/test_bpf"; do
-		[ -d "${experiment_dir}" ] || continue
-
-		error_dir="${experiment_dir}/error"
-		empty_dir="${experiment_dir}/empty"
-		mkdir -p "${error_dir}" "${empty_dir}"
-
-		while IFS= read -r -d '' file; do
-			relative_path="${file#"${RESULTS_DIR}/"}"
-			printf 'incomplete\t%s\n' "${relative_path}" >> "${validation_file}"
-			mv -- "${file}" "${error_dir}/"
+	shopt -s nullglob
+	for file in "${RESULTS_DIR}"/{test_progs,test_bpf}/*.json{,.tmp}; do
+		if [[ "${file}" == *.tmp ]] || ! state="$(jq -sr '
+			if length != 1 or (.[0] | type) != "array" then error("expected one run array")
+			else .[0] | if length == 0 then "empty"
+			elif any(.[]; .capture_status != "complete" and .capture_status != "unsupported") then "error"
+			elif any(.[]; .capture_status == "unsupported") then "unsupported"
+			else "complete" end end
+		' "${file}")"; then
+			state=error
+		fi
+		case "${state}" in
+		complete) VALID_JSON_COUNT=$((VALID_JSON_COUNT + 1)) ;;
+		unsupported) UNSUPPORTED_JSON_COUNT=$((UNSUPPORTED_JSON_COUNT + 1)) ;;
+		empty) EMPTY_JSON_COUNT=$((EMPTY_JSON_COUNT + 1)) ;;
+		*)
 			INVALID_JSON_COUNT=$((INVALID_JSON_COUNT + 1))
-		done < <(find "${experiment_dir}" -maxdepth 1 -type f \
-			-name '*.json.tmp' -print0)
-
-		while IFS= read -r -d '' file; do
-			relative_path="${file#"${RESULTS_DIR}/"}"
-			if ! jq -e 'type == "array"' "${file}" >/dev/null 2>&1; then
-				printf 'invalid\t%s\n' "${relative_path}" >> "${validation_file}"
-				mv -- "${file}" "${error_dir}/"
-				INVALID_JSON_COUNT=$((INVALID_JSON_COUNT + 1))
-			elif jq -e 'length == 0' "${file}" >/dev/null; then
-				printf 'empty\t%s\n' "${relative_path}" >> "${validation_file}"
-				mv -- "${file}" "${empty_dir}/"
-				EMPTY_JSON_COUNT=$((EMPTY_JSON_COUNT + 1))
-			else
-				printf 'valid\t%s\n' "${relative_path}" >> "${validation_file}"
-				VALID_JSON_COUNT=$((VALID_JSON_COUNT + 1))
-			fi
-		done < <(find "${experiment_dir}" -maxdepth 1 -type f \
-			-name '*.json' -print0)
+			echo "Invalid JSON or incomplete capture: ${file}" >&2
+			;;
+		esac
 	done
+	shopt -u nullglob
 }
 
 set +e
@@ -222,7 +208,7 @@ if [ -f "${RESULTS_DIR}/exit-status" ]; then
 	status="$(cat "${RESULTS_DIR}/exit-status")"
 fi
 
-classify_json_results
+check_json_results
 
 if [ "${INVALID_JSON_COUNT}" -gt 0 ]; then
 	echo "Error: ${INVALID_JSON_COUNT} invalid or incomplete JSON file(s)." >&2
@@ -231,16 +217,16 @@ if [ "${INVALID_JSON_COUNT}" -gt 0 ]; then
 	fi
 fi
 if [ "${VALID_JSON_COUNT}" -eq 0 ]; then
-	echo "Error: no valid non-empty JSON trace was generated." >&2
+	echo "Error: no non-empty JSON trace with complete capture status was generated." >&2
 	if [ "${status}" -eq 0 ]; then
 		status=1
 	fi
 fi
 
-echo "JSON valid (non-empty): ${VALID_JSON_COUNT}"
+echo "JSON complete status:   ${VALID_JSON_COUNT}"
+echo "JSON unsupported:       ${UNSUPPORTED_JSON_COUNT}"
 echo "JSON empty:             ${EMPTY_JSON_COUNT}"
 echo "JSON invalid/incomplete:${INVALID_JSON_COUNT}"
-echo "Validation manifest:    ${RESULTS_DIR}/json-validation.tsv"
 echo "Exit status: ${status}"
 echo "Results: ${RESULTS_DIR}"
 

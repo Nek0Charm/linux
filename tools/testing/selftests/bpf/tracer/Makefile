@@ -42,7 +42,7 @@ BPF_CFLAGS := -g -O2 \
 # Libraries
 LIBS := $(LIBBPF_A) -lelf -lz
 
-.PHONY: all clean
+.PHONY: all clean test check
 
 all: $(APP)
 
@@ -69,3 +69,10 @@ $(APP): $(USER_C) trace_consumer.c trace_consumer.h $(SKEL_H) trace_common.h ../
 clean:
 	@echo "  CLEAN"
 	rm -f $(APP) $(BPF_OBJ) $(SKEL_H) vmlinux.h
+
+# Check the consumer and scripts without libbpf, BTF, or root privileges.
+test check:
+	$(CC) $(CFLAGS) -Wextra -Werror -fsyntax-only trace_consumer.c
+	@for script in run_vmtest.sh guest_run.sh run_traces.sh run_test_bpf.sh helper_memory_smoke.sh; do \
+		bash -n $$script || exit; \
+	done
