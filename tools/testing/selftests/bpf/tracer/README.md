@@ -70,7 +70,8 @@ tools/testing/selftests/bpf/vmtest.sh \
 The sequenced event format keeps the legacy validator's mandatory fields:
 `sp_list` lists frame pointers in frame-entry order (including reused stack
 addresses), and `jmp_map_ptr` and `jmp_max_entries` describe the first
-successful tail call's map. Programs without a successful tail call use zero.
+successful tail call's map. If no tail call succeeds, the first declared
+program-array map supplies those fields; programs without one use zero.
 Each `jmp_table` entry includes its target's `insns` as well as its `code_id`.
 The `codes`, region lifetimes, helper events, and memory snapshots remain
 available to readers of the extended format.

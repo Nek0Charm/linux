@@ -12,6 +12,14 @@
 #define TRACE_CALL_BYTES 4096
 #define TRACE_RUN_BYTES (1024 * 1024)
 #define TRACE_MAX_FRAMES 8
+#define TRACE_MAX_MAPS 32
+#define TRACE_MAP 12
+#define TRACE_INITIAL_MEMORY 2
+#define TRACE_READ 1
+#define TRACE_WRITE 2
+#define TRACE_UNSUPPORTED_MAP 12
+#define TRACE_UNSUPPORTED_ALIAS 13
+#define TRACE_UNSUPPORTED_CONCURRENCY 14
 
 #define TRACE_START 1
 #define TRACE_CODE 2
@@ -64,6 +72,20 @@ struct trace_region {
 	__u32 type;
 	__u32 frame_id;
 	__u32 parent_frame_id;
+	__u32 map_id, element_index, entry_id, permissions;
+};
+
+struct trace_map {
+	__u64 address;
+	__u32 map_id, kernel_map_id, map_region_id;
+	__u32 map_type, key_size, value_size, max_entries, map_flags;
+	__u32 value_stride, code_id, supported;
+};
+
+struct trace_map_effect {
+	__u64 flags;
+	__u32 map_id, key_snapshot_id, input_value_snapshot_id;
+	__u32 state, entry_id, value_snapshot_id, return_region_id;
 };
 
 struct trace_helper {
@@ -76,10 +98,12 @@ struct trace_helper {
 	__u32 helper_id;
 	__u32 status;
 	__u32 snapshots;
+	struct trace_map_effect map_effect;
 };
 
 struct trace_memory {
 	__u64 address;
+	__u64 read_address;
 	__u64 offset;
 	__u32 snapshot_id;
 	__u32 call_id;
@@ -90,9 +114,11 @@ struct trace_memory {
 	__u32 chunk_offset;
 	__u32 valid_length;
 	__u32 expected_fault;
+	__u32 map_id, code_id;
 };
 
 struct trace_code {
+	__u64 time_ns;
 	__u64 prog_ptr;
 	__u64 ctx_ptr;
 	__u64 map_ptr;
@@ -104,6 +130,7 @@ struct trace_code {
 };
 
 struct trace_summary {
+	__u64 time_ns;
 	__u64 events;
 	__u64 steps;
 	__u64 calls;
@@ -117,6 +144,7 @@ struct bpf_trace_event {
 	struct trace_hdr hdr;
 	union {
 		struct trace_region region;
+		struct trace_map map;
 		struct trace_helper helper;
 		struct trace_memory memory;
 		struct trace_code code;

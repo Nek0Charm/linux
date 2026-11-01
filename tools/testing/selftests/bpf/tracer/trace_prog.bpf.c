@@ -70,7 +70,7 @@ int on_event(struct bpf_raw_tracepoint_args *ctx)
 		len = out->event.memory.valid_length;
 		if (!err && len && len <= TRACE_CHUNK_SIZE)
 			err = bpf_probe_read_kernel(out->bytes, len,
-				(const void *)(out->event.memory.address + out->event.memory.chunk_offset));
+				(const void *)(out->event.memory.read_address + out->event.memory.chunk_offset));
 		else if (len > TRACE_CHUNK_SIZE)
 			err = -7;
 		out->event.hdr = hdr;

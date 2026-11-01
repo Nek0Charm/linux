@@ -73,6 +73,9 @@ clean:
 # Check the consumer and scripts without libbpf, BTF, or root privileges.
 test check:
 	$(CC) $(CFLAGS) -Wextra -Werror -fsyntax-only trace_consumer.c
+	@set -e; binary=$$(mktemp); trap 'rm -f "$$binary"' EXIT; \
+		$(CC) $(CFLAGS) -Wextra -Werror trace_consumer.c trace_consumer_test.c -o "$$binary"; \
+		"$$binary"
 	@CC="$(CC)" CFLAGS="$(CFLAGS) -Wextra -Werror" bash ./trace_compat_test.sh
 	@for script in run_vmtest.sh guest_run.sh run_traces.sh run_test_bpf.sh helper_memory_smoke.sh; do \
 		bash -n $$script || exit; \
