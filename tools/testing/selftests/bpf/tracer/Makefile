@@ -70,6 +70,10 @@ clean:
 	@echo "  CLEAN"
 	rm -f $(APP) $(BPF_OBJ) $(SKEL_H) vmlinux.h
 
-# Check JSON reader compatibility without libbpf, BTF, or root privileges.
+# Check the consumer and scripts without libbpf, BTF, or root privileges.
 test check:
+	$(CC) $(CFLAGS) -Wextra -Werror -fsyntax-only trace_consumer.c
 	@CC="$(CC)" CFLAGS="$(CFLAGS) -Wextra -Werror" bash ./trace_compat_test.sh
+	@for script in run_vmtest.sh guest_run.sh run_traces.sh run_test_bpf.sh helper_memory_smoke.sh; do \
+		bash -n $$script || exit; \
+	done
