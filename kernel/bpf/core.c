@@ -296,6 +296,8 @@ static bool bpf_interp_trace_array_value_region(const struct bpf_map *map,
  * contents are not serialized.  Drop only when the program actually accesses
  * those bytes; merely carrying or passing the map pointer remains traceable.
  */
+static bool interp_trace_registered_access(u64 addr, u64 size, bool write);
+
 static bool bpf_interp_trace_map_value_access(const struct bpf_insn *insn,
 					      const u64 *regs)
 {
@@ -338,7 +340,7 @@ static bool bpf_interp_trace_map_value_access(const struct bpf_insn *insn,
 							 &map_start, &map_end))
 			continue;
 		if (addr < map_end && map_start < access_end)
-			return true;
+			return !interp_trace_registered_access(addr, size, class != BPF_LDX);
 	}
 
 	return false;
