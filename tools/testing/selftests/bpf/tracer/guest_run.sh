@@ -70,6 +70,9 @@ run_smoke()
 cd "${TRACER_DIR}"
 
 case "${SUITE}" in
+map-helper)
+	"${TRACER_DIR}/map_helper_smoke.sh"
+	;;
 helper-memory)
 	"${TRACER_DIR}/helper_memory_smoke.sh"
 	;;
