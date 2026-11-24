@@ -96,15 +96,13 @@ int main(int argc, char **argv)
 
 	/* 5. Poll continuously and consume data emitted by the kernel. */
 	while (!exiting) {
-		err = ring_buffer__poll(rb, 100);
-		if (err < 0) {
-			if (err == -EINTR) {
-				if (exiting) {
-					err = 0;
-					break;
-				}
-				continue;
-			}
+		int result = ring_buffer__poll(rb, 100);
+
+		/* Successful polls return a record count, not an exit status. */
+		if (result == -EINTR)
+			continue;
+		if (result < 0) {
+			err = result;
 			printf("Error polling ring buffer: %d\n", err);
 			break;
 		}

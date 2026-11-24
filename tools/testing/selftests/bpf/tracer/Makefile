@@ -76,6 +76,7 @@ test check:
 	@set -e; binary=$$(mktemp); trap 'rm -f "$$binary"' EXIT; \
 		$(CC) $(CFLAGS) -Wextra -Werror trace_consumer.c trace_consumer_test.c -o "$$binary"; \
 		"$$binary"
+	@CC="$(CC)" CFLAGS="$(CFLAGS) -Wextra -Werror" bash ./trace_user_test.sh
 	@CC="$(CC)" CFLAGS="$(CFLAGS) -Wextra -Werror" bash ./trace_compat_test.sh
 	@for script in run_vmtest.sh guest_run.sh run_traces.sh run_test_bpf.sh helper_memory_smoke.sh map_helper_smoke.sh; do \
 		bash -n $$script || exit; \
